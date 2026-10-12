@@ -1,7 +1,7 @@
 """QLoRA SFT for the Jev BUY/SELL/HOLD readout on Qwen2.5-3B-Instruct.
 
 Fits an affordable single-GPU pod (L4 / A10 / RTX 4090 24GB; T4 16GB with
-``--per-device-train-batch-size 1``). Loads ``jev_train.jsonl`` as
+``--per-device-train-batch-size 1``). Loads ``data/jev_train_5m.jsonl`` as
 prompt-completion pairs so TRL masks the user state and trains only the
 discrete action token.
 """
@@ -9,18 +9,16 @@ discrete action token.
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
+import sys
 
-import torch
-from datasets import load_dataset
-from peft import LoraConfig
-from transformers import AutoTokenizer, BitsAndBytesConfig
-from trl import SFTConfig, SFTTrainer
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-DEFAULT_DATA = "jev_train.jsonl"
-DEFAULT_OUTPUT = "checkpoints/qwen25-3b-jev-lora"
+DEFAULT_DATA = "data/jev_train_5m.jsonl"
+DEFAULT_OUTPUT = "models/checkpoints/qwen25-3b-jev-lora"
 
 # Qwen2 / Qwen2.5 attention projections.
 ATTN_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -60,6 +58,8 @@ def compute_dtype() -> torch.dtype:
 
 def load_jev_dataset(path: str, eval_ratio: float, seed: int):
     jsonl = Path(path)
+    if not jsonl.is_absolute():
+        jsonl = PROJECT_ROOT / jsonl
     if not jsonl.is_file():
         raise FileNotFoundError(
             f"Training file not found: {jsonl}. Generate it with dataset_generator.py"
@@ -167,8 +167,24 @@ def build_sft_config(args: argparse.Namespace, dtype: torch.dtype, has_eval: boo
 
 
 def main() -> None:
+    global torch, load_dataset, LoraConfig, AutoTokenizer, BitsAndBytesConfig, SFTConfig, SFTTrainer
+
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    import torch
+    from datasets import load_dataset
+    from peft import LoraConfig
+    from transformers import AutoTokenizer, BitsAndBytesConfig
+    from trl import SFTConfig, SFTTrainer
+
+    data_path = Path(args.data)
+    if not data_path.is_absolute():
+        data_path = PROJECT_ROOT / data_path
+    args.data = str(data_path)
+    output_dir = Path(args.output_dir)
+    if not output_dir.is_absolute():
+        output_dir = PROJECT_ROOT / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir = str(output_dir)
     dtype = compute_dtype()
     train_ds, eval_ds = load_jev_dataset(args.data, args.eval_ratio, args.seed)
 

@@ -75,9 +75,17 @@ class PropFirmRiskManager:
     platform: Platform = Platform.GENERIC
     per_trade_risk_pct: float = PER_TRADE_RISK_PCT
     daily_loss_limit_pct: float = DAILY_LOSS_LIMIT_PCT
+    daily_loss_limit_usd: Optional[float] = 500.0
+    max_consecutive_stopouts: int = 2
     point_value: float = 1.0
     min_quantity: float = 0.0
     quantity_step: float = 1.0
+    daily_profit_target: Optional[float] = None
+    baseline_confidence: float = 0.65
+    max_target_confidence: float = 0.80
+    confidence_escalation_progress: float = 0.75
+    target_risk_floor_multiplier: float = 0.25
+    session_progress: float = 0.0
     equity: float = field(init=False)
     session_start_equity: float = field(init=False)
     peak_equity: float = field(init=False)
@@ -85,6 +93,7 @@ class PropFirmRiskManager:
     open_risk_dollars: float = field(default=0.0, init=False)
     halted: bool = field(default=False, init=False)
     halt_reason: str = field(default="", init=False)
+    consecutive_stopouts: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.starting_equity <= 0:
@@ -96,10 +105,22 @@ class PropFirmRiskManager:
         self.daily_loss_limit_pct = min(self.daily_loss_limit_pct, DAILY_LOSS_LIMIT_PCT)
         if self.daily_loss_limit_pct <= 0:
             raise ValueError("daily_loss_limit_pct must be > 0")
+        if self.daily_loss_limit_usd is not None and self.daily_loss_limit_usd <= 0:
+            raise ValueError("daily_loss_limit_usd must be > 0")
+        if self.max_consecutive_stopouts < 1:
+            raise ValueError("max_consecutive_stopouts must be >= 1")
         if self.point_value <= 0:
             raise ValueError("point_value must be > 0")
         if self.quantity_step <= 0:
             raise ValueError("quantity_step must be > 0")
+        if self.daily_profit_target is not None and self.daily_profit_target <= 0:
+            raise ValueError("daily_profit_target must be > 0 when configured")
+        if not 0 <= self.baseline_confidence <= self.max_target_confidence <= 1:
+            raise ValueError("confidence thresholds must satisfy 0 <= baseline <= max <= 1")
+        if not 0 < self.confidence_escalation_progress <= 1:
+            raise ValueError("confidence_escalation_progress must be in (0, 1]")
+        if not 0 < self.target_risk_floor_multiplier <= 1:
+            raise ValueError("target_risk_floor_multiplier must be in (0, 1]")
         self.equity = float(self.starting_equity)
         self.session_start_equity = float(self.starting_equity)
         self.peak_equity = float(self.starting_equity)
@@ -115,6 +136,8 @@ class PropFirmRiskManager:
     @property
     def daily_loss_budget(self) -> float:
         pct_budget = self.session_start_equity * self.daily_loss_limit_pct
+        if self.daily_loss_limit_usd is not None:
+            pct_budget = min(pct_budget, self.daily_loss_limit_usd)
         usd_cap = self.profile.daily_loss_usd
         if usd_cap is None:
             return pct_budget
@@ -136,6 +159,59 @@ class PropFirmRiskManager:
         self.open_risk_dollars = 0.0
         self.halted = False
         self.halt_reason = ""
+        self.session_progress = 0.0
+        self.consecutive_stopouts = 0
+
+    def record_trade_outcome(self, pnl: float, *, stop_out: bool) -> None:
+        """Track stop-out streaks and immediately trip the session lock when due."""
+        if stop_out:
+            self.consecutive_stopouts += 1
+        else:
+            self.consecutive_stopouts = 0
+        if self.consecutive_stopouts >= self.max_consecutive_stopouts:
+            self.halted = True
+            self.halt_reason = (
+                f"session locked after {self.consecutive_stopouts} consecutive stop-outs"
+            )
+        self._trip_if_breached()
+
+    def required_confidence(self, session_progress: Optional[float] = None) -> float:
+        """Confidence gate rises near a daily target, then relaxes if behind pace."""
+        if self.daily_profit_target is None:
+            return self.baseline_confidence
+        elapsed = self.session_progress if session_progress is None else float(session_progress)
+        if not 0 <= elapsed <= 1:
+            raise ValueError("session_progress must be between 0 and 1")
+        progress = max(0.0, self.daily_pnl) / self.daily_profit_target
+        if progress <= self.confidence_escalation_progress:
+            required = self.baseline_confidence
+        else:
+            fraction = min(
+                1.0,
+                (progress - self.confidence_escalation_progress)
+                / (1.0 - self.confidence_escalation_progress),
+            )
+            required = self.baseline_confidence + fraction * (
+                self.max_target_confidence - self.baseline_confidence
+            )
+        if elapsed > 0.5 and progress < elapsed:
+            decay = min(1.0, (elapsed - 0.5) / 0.5)
+            required = self.baseline_confidence + (required - self.baseline_confidence) * (1.0 - decay)
+        return min(self.max_target_confidence, max(self.baseline_confidence, required))
+
+    def target_risk_multiplier(self) -> float:
+        """Scale per-trade dollars-at-risk down as realized/unrealized target nears."""
+        if self.daily_profit_target is None:
+            return 1.0
+        progress = max(0.0, self.daily_pnl) / self.daily_profit_target
+        if progress <= self.confidence_escalation_progress:
+            return 1.0
+        fraction = min(
+            1.0,
+            (progress - self.confidence_escalation_progress)
+            / (1.0 - self.confidence_escalation_progress),
+        )
+        return 1.0 - fraction * (1.0 - self.target_risk_floor_multiplier)
 
     def mark_equity(self, equity: float) -> None:
         if equity < 0:
@@ -176,6 +252,7 @@ class PropFirmRiskManager:
         *,
         equity: Optional[float] = None,
         point_value: Optional[float] = None,
+        cost_per_contract: float = 0.0,
     ) -> PositionSize:
         if stop_distance <= 0:
             return PositionSize(
@@ -208,20 +285,35 @@ class PropFirmRiskManager:
                 blocked=True,
                 reason="point_value must be > 0",
             )
+        if cost_per_contract < 0:
+            return PositionSize(
+                quantity=0.0,
+                risk_dollars=0.0,
+                stop_distance=stop_distance,
+                dollar_risk_per_unit=0.0,
+                blocked=True,
+                reason="cost_per_contract cannot be negative",
+            )
 
-        risk_dollars = mark * self.per_trade_risk_pct
+        risk_dollars = (
+            mark
+            * self.per_trade_risk_pct
+            * self.target_risk_multiplier()
+        )
         allowed, reason = self.can_trade(additional_risk=risk_dollars)
         if not allowed:
             return PositionSize(
                 quantity=0.0,
                 risk_dollars=risk_dollars,
                 stop_distance=stop_distance,
-                dollar_risk_per_unit=stop_distance * pv,
+                dollar_risk_per_unit=stop_distance * pv + cost_per_contract,
                 blocked=True,
                 reason=reason,
             )
 
-        dollar_risk_per_unit = stop_distance * pv
+        # Include round-trip commissions/slippage supplied by the caller so
+        # sized quantity stays within the nominal risk budget after friction.
+        dollar_risk_per_unit = stop_distance * pv + cost_per_contract
         raw_qty = risk_dollars / dollar_risk_per_unit
         quantity = self._round_quantity(raw_qty)
 
@@ -273,9 +365,8 @@ class PropFirmRiskManager:
             self.halted = True
             self.halt_reason = (
                 f"{self.platform.value} daily-loss circuit breaker tripped: "
-                f"loss {loss:.2f} reached the "
-                f"{self.daily_loss_limit_pct * 100:.1f}% / "
-                f"{self.daily_loss_budget:.2f} cap"
+                f"loss {loss:.2f} reached the {self.daily_loss_budget:.2f} cap "
+                f"(max {self.daily_loss_limit_pct * 100:.1f}% / configured USD limit)"
             )
             return
 

@@ -3,10 +3,9 @@
 
 import os
 import sqlite3
+from pathlib import Path
 
-from datasets import load_dataset
-
-from bpe import normalize_text
+from .bpe import normalize_text
 
 DEFAULT_HF_DATASETS = (
     "nuhmanpk/financial-literacy-instruct,"
@@ -28,7 +27,7 @@ def resolve_storage_dir():
     elif os.name != "nt" and os.path.isdir("/tmp"):
         base_dir = "/tmp"
     else:
-        base_dir = os.getcwd()
+        base_dir = str(Path(__file__).resolve().parents[1] / "data")
     os.makedirs(base_dir, exist_ok=True)
     return base_dir
 
@@ -115,6 +114,8 @@ def source_label_for_dataset(dataset_name):
 
 
 def import_hf_dataset(conn, dataset_name, remaining_limit, min_article_chars):
+    from datasets import load_dataset
+
     print(f"Loading Hugging Face dataset: {dataset_name}")
     dataset = load_dataset(dataset_name)
     split_name = "train" if "train" in dataset else next(iter(dataset.keys()))

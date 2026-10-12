@@ -2,11 +2,17 @@
 """Train a from-scratch BPE tokenizer on the local finance corpus."""
 
 import os
+import sys
+from pathlib import Path
 
 import torch
 
-from bpe import BPETokenizer
-from corpus import (
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from models.bpe import BPETokenizer
+from models.corpus import (
     DEFAULT_HF_DATASETS,
     build_or_refresh_article_db,
     load_training_documents_from_db,
@@ -23,6 +29,9 @@ SPECIAL_TOKENS = [
 
 STORAGE_DIR = resolve_storage_dir()
 DB_PATH = os.path.join(STORAGE_DIR, "investment_articles.db")
+LEGACY_DB_PATH = PROJECT_ROOT / "investment_articles.db"
+if not os.path.exists(DB_PATH) and LEGACY_DB_PATH.is_file():
+    DB_PATH = str(LEGACY_DB_PATH)
 TOKENIZER_PATH = os.path.join(STORAGE_DIR, "bpe_tokenizer.json")
 HF_DATASETS = [
     name.strip()

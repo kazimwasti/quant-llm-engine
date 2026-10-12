@@ -24,9 +24,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Optional
 
-import httpx
-
-from engine import ExecutionPayload
+from .engine import ExecutionPayload
 
 DEFAULT_BASE_URL = "https://api.topstepx.com"
 LOGIN_PATH = "/api/Auth/loginKey"
@@ -177,6 +175,10 @@ class TopstepXClient:
         self.attach_stop_bracket = attach_stop_bracket
         self._token: Optional[str] = None
         self._lock = asyncio.Lock()
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("TopstepX execution requires httpx; install requirements.txt") from exc
         self._http = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,

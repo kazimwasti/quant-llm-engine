@@ -17,17 +17,20 @@ of the pipeline stays testable without a trained transformer.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 import pandas as pd
 
-from risk import PositionSize, PropFirmRiskManager
-from strategy import (
+from .risk import PositionSize, PropFirmRiskManager
+from .strategy import (
     DEFAULT_ATR_STOP_MULTIPLIER,
+    DEFAULT_ATR_TARGET_MULTIPLIER,
     add_indicators,
     generate_signals,
     latest_snapshot,
+    atr_envelope_widths,
+    discrete_expected_checkpoints,
 )
 
 ACTIONS = ("BUY", "SELL", "HOLD")
@@ -54,6 +57,13 @@ class MarketState:
     long_stop: float
     short_stop: float
     signal: int = 0
+    session_allowed: bool = True
+    volatility_active: bool = True
+    expected_drift: float = 0.0
+    session_progress: float = 0.0
+    htf_ema: float = math.nan
+    long_structure_confirmed: bool = False
+    short_structure_confirmed: bool = False
 
     @property
     def ema_status(self) -> str:
@@ -92,6 +102,8 @@ class MarketState:
             self.atr_14,
             self.long_stop,
             self.short_stop,
+            self.expected_drift,
+            self.htf_ema,
         )
         return all(math.isfinite(v) for v in values)
 
@@ -141,6 +153,13 @@ def ingest_market_state(df: pd.DataFrame) -> MarketState:
         long_stop=float(snapshot.get("long_stop", math.nan)),
         short_stop=float(snapshot.get("short_stop", math.nan)),
         signal=int(snapshot.get("signal", 0) or 0),
+        session_allowed=bool(snapshot.get("session_allowed", False)),
+        volatility_active=bool(snapshot.get("volatility_active", False)),
+        expected_drift=float(snapshot.get("ema_drift", 0.0) or 0.0),
+        session_progress=float(snapshot.get("session_progress", 0.0) or 0.0),
+        htf_ema=float(snapshot.get("htf_ema", math.nan)),
+        long_structure_confirmed=bool(snapshot.get("long_structure_confirmed", False)),
+        short_structure_confirmed=bool(snapshot.get("short_structure_confirmed", False)),
     )
 
 
@@ -151,10 +170,18 @@ def format_decision_prompt(state: MarketState) -> str:
         f"close={state.close:.6f}\n"
         f"ema_200={state.ema_200:.6f}\n"
         f"ema_status={state.ema_status}\n"
+        f"htf_ema={state.htf_ema:.6f}\n"
+        f"htf_alignment={('ABOVE' if state.close > state.htf_ema else 'BELOW' if state.close < state.htf_ema else 'EQUAL') if math.isfinite(state.htf_ema) else 'UNKNOWN'}\n"
         f"stoch_k={state.stoch_k:.4f}\n"
         f"stoch_d={state.stoch_d:.4f}\n"
         f"stoch_regime={state.stoch_regime}\n"
         f"atr_14={state.atr_14:.6f}\n"
+        f"ema_drift_per_bar={state.expected_drift:.6f}\n"
+        f"session_progress={state.session_progress:.4f}\n"
+        f"session_allowed={int(state.session_allowed)}\n"
+        f"volatility_active={int(state.volatility_active)}\n"
+        f"long_structure_confirmed={int(state.long_structure_confirmed)}\n"
+        f"short_structure_confirmed={int(state.short_structure_confirmed)}\n"
         f"long_stop={state.long_stop:.6f}\n"
         f"short_stop={state.short_stop:.6f}\n"
         f"rule_signal={state.rule_signal}\n"
@@ -195,6 +222,12 @@ def feature_action_logits(state: MarketState) -> dict[str, float]:
     # HOLD wins when trend/momentum disagree or both are small.
     disagreement = abs(trend) * (1.0 if trend * momentum < 0 else 0.35)
     hold = 0.55 - 0.35 * abs(trend) - 0.80 * abs(momentum) + disagreement
+    if not state.long_structure_confirmed:
+        buy = -math.inf
+    if not state.short_structure_confirmed:
+        sell = -math.inf
+    if not state.long_structure_confirmed and not state.short_structure_confirmed:
+        hold = max(hold, 1.0)
     return {"BUY": buy, "SELL": sell, "HOLD": hold}
 
 
@@ -258,12 +291,41 @@ class TorchCausalLMBackend:
         return logits
 
 
+class TorchSequenceClassifierBackend:
+    """Closed BUY/SELL/HOLD scorer backed by a PEFT sequence classifier."""
+
+    ACTION_LABELS = {"BUY": 0, "SELL": 1, "HOLD": 2}
+
+    def __init__(self, model, tokenizer, max_length: int = 1024):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def score_actions(self, prompt: str, actions: Sequence[str]) -> Mapping[str, float]:
+        import torch
+
+        self.model.eval()
+        encoded = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length,
+        )
+        device = self.model.get_input_embeddings().weight.device
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        with torch.no_grad():
+            logits = self.model(**encoded).logits[0]
+        return {action: float(logits[self.ACTION_LABELS[action]].item()) for action in actions}
+
+
 def extract_decision(
     state: MarketState,
     backend: Optional[TokenLogitBackend] = None,
-    min_confidence: float = 0.0,
+    min_confidence: float = 0.65,
 ) -> Decision:
     """Softmax over BUY/SELL/HOLD scores only; never parse generated text."""
+    if not 0.0 <= min_confidence <= 1.0:
+        raise ValueError("min_confidence must be between 0 and 1")
     prompt = format_decision_prompt(state)
     source = "feature_fallback"
     if backend is None:
@@ -280,8 +342,16 @@ def extract_decision(
     probabilities = softmax(logits)
     action = max(ACTIONS, key=lambda name: probabilities[name])
     confidence = probabilities[action]
-    if confidence < min_confidence:
+    if action in ("BUY", "SELL") and probabilities[action] < min_confidence:
         action = "HOLD"
+    if not state.session_allowed or not state.volatility_active:
+        action = "HOLD"
+        source = f"{source}+regime_blocked"
+    if (action == "BUY" and state.close <= state.htf_ema) or (
+        action == "SELL" and state.close >= state.htf_ema
+    ):
+        action = "HOLD"
+        source = f"{source}+htf_blocked"
     if not state.is_complete():
         action = "HOLD"
         source = f"{source}+incomplete_state"
@@ -294,6 +364,59 @@ def extract_decision(
         source=source,
         market=state,
     )
+
+
+class DiscreteDeviationTrigger:
+    """Re-arm a multi-bar expected path and emit only on envelope deviation.
+
+    The first observation is always a decision checkpoint. Thereafter model
+    re-evaluation is requested when price leaves the path's ATR envelope or
+    when the discrete horizon completes. Call ``observe`` on every bar, even
+    when no model decision is due.
+    """
+
+    def __init__(
+        self,
+        horizon: int = 12,
+        envelope_atr_multiplier: float = 1.0,
+    ) -> None:
+        if horizon < 1 or envelope_atr_multiplier <= 0:
+            raise ValueError("horizon and envelope_atr_multiplier must be positive")
+        self.horizon = horizon
+        self.envelope_atr_multiplier = envelope_atr_multiplier
+        self.expected: list[float] = []
+        self.widths: list[float] = []
+        self.checkpoint = 0
+        self.last_deviation_atr = 0.0
+
+    def _arm(self, state: MarketState) -> None:
+        drift = state.expected_drift if math.isfinite(state.expected_drift) else 0.0
+        self.expected = discrete_expected_checkpoints(state.close, drift, self.horizon)
+        self.widths = atr_envelope_widths(
+            state.atr_14, self.horizon, self.envelope_atr_multiplier
+        ) if state.atr_14 > 0 else []
+        self.checkpoint = 0
+
+    def observe(self, state: MarketState) -> bool:
+        if not state.is_complete():
+            return False
+        if not self.expected:
+            self._arm(state)
+            return True
+        self.checkpoint += 1
+        i = min(self.checkpoint, self.horizon) - 1
+        expected = self.expected[i]
+        self.widths = atr_envelope_widths(
+            state.atr_14, self.horizon, self.envelope_atr_multiplier
+        )
+        width = self.widths[i]
+        self.last_deviation_atr = abs(state.close - expected) / max(state.atr_14, 1e-12)
+        deviated = abs(state.close - expected) > width
+        expired = self.checkpoint >= self.horizon
+        if deviated or expired:
+            self._arm(state)
+            return True
+        return False
 
 
 def _stop_for_action(state: MarketState, action: str) -> tuple[float, float]:
@@ -320,6 +443,7 @@ def build_execution_payload(
     risk: PropFirmRiskManager,
     *,
     point_value: Optional[float] = None,
+    cost_per_contract: float = 0.0,
 ) -> ExecutionPayload:
     """Size BUY/SELL through the prop-firm manager; HOLD never opens risk."""
     breaker = risk.circuit_breaker_active()
@@ -367,7 +491,11 @@ def build_execution_payload(
         )
 
     stop_price, stop_distance = _stop_for_action(decision.market, decision.action)
-    size = risk.size_position(stop_distance, point_value=point_value)
+    size = risk.size_position(
+        stop_distance,
+        point_value=point_value,
+        cost_per_contract=cost_per_contract,
+    )
     if size.blocked or size.quantity <= 0:
         return ExecutionPayload(
             approved=False,
@@ -414,18 +542,59 @@ class TradingEngine:
 
     risk: PropFirmRiskManager
     backend: Optional[TokenLogitBackend] = None
-    min_confidence: float = 0.0
+    min_confidence: float = 0.65
     auto_reserve: bool = False
+    deviation_trigger: DiscreteDeviationTrigger = field(default_factory=DiscreteDeviationTrigger)
 
     def step(self, df: pd.DataFrame) -> ExecutionPayload:
         state = ingest_market_state(df)
+        self.risk.session_progress = state.session_progress
+        if self.risk.circuit_breaker_active():
+            return ExecutionPayload(
+                approved=False,
+                action="HOLD",
+                model_action="HOLD",
+                quantity=0.0,
+                side=None,
+                entry=state.close,
+                stop_price=None,
+                stop_distance=0.0,
+                risk_dollars=0.0,
+                probabilities={"BUY": 0.0, "SELL": 0.0, "HOLD": 1.0},
+                confidence=1.0,
+                circuit_breaker=True,
+                reason=self.risk.halt_reason or "session risk lock active",
+                prompt="",
+                source="risk_circuit_breaker",
+            )
+        if not self.deviation_trigger.observe(state):
+            return ExecutionPayload(
+                approved=False,
+                action="HOLD",
+                model_action="HOLD",
+                quantity=0.0,
+                side=None,
+                entry=state.close,
+                stop_price=None,
+                stop_distance=0.0,
+                risk_dollars=0.0,
+                probabilities={"BUY": 0.0, "SELL": 0.0, "HOLD": 1.0},
+                confidence=1.0,
+                circuit_breaker=self.risk.circuit_breaker_active(),
+                reason="expected path remains inside ATR deviation envelope",
+                prompt="",
+                source="deviation_trigger_skipped",
+            )
         backend = self.backend
         if backend is None:
             backend = FeatureLogitBackend(state)
         decision = extract_decision(
             state,
             backend=backend,
-            min_confidence=self.min_confidence,
+            min_confidence=max(
+                self.min_confidence,
+                self.risk.required_confidence(state.session_progress),
+            ),
         )
         payload = build_execution_payload(decision, self.risk)
         if self.auto_reserve and payload.approved and payload.size is not None:
