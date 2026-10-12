@@ -1,0 +1,20 @@
+# Environment & Credentials
+.env
+*.env
+env.json
+
+# Local Databases & Caches
+*.db
+*.sqlite
+__pycache__/
+*.pyc
+*.json
+!bpe_tokenizer.json
+
+# Backtest Output / Local Test Logs
+trades_log.csv
+equity_curve.csv
+
+# OS Files
+.DS_Store
+Thumbs.db
