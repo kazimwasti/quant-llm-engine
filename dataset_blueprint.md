@@ -1,0 +1,43 @@
+# Quant LLM Training Dataset Blueprint & Prompt Rules
+
+This document outlines the prompt specification and decision rules for generating training pairs for our Jev-style fine-tuned model (Qwen-2.5-3B).
+
+---
+
+## 1. Target JSONL Format
+Each training sample strictly adheres to a single line in JSONL format, ending with `Action:` so the model only predicts the next action token:
+
+```json
+{"prompt": "State:\nclose=18250.500000\nema_200=18100.250000\nema_status=ABOVE\nstoch_k=82.5000\nstoch_d=75.1000\nstoch_regime=K_ABOVE_D\natr_14=45.200000\nlong_stop=18182.700000\nshort_stop=18318.300000\nrule_signal=LONG\n\nOptions:\n[BUY] Go long. Price is above the 200 EMA with upward stochastic momentum.\n[SELL] Go short. Price is below the 200 EMA with downward stochastic momentum.\n[HOLD] Stay flat. Mixed, incomplete, or insufficient edge.\n\nSelect one option. Answer only with BUY, SELL, or HOLD.\nAction:", "completion": " BUY"}
+```
+
+---
+
+## 2. Decision Logic Matrix
+
+### A. High-Probability `BUY` Conditions
+* **Price Location:** `close` > `ema_200` (`ema_status` = `ABOVE`).
+* **Momentum:** `stoch_k` > `stoch_d` (`stoch_regime` = `K_ABOVE_D`).
+* **Rule Signal:** `rule_signal` = `LONG`.
+* **Forward Barrier:** Price reaches the $+1.5\times\text{ATR}$ upper barrier before hitting the lower stop barrier.
+
+### B. High-Probability `SELL` Conditions
+* **Price Location:** `close` < `ema_200` (`ema_status` = `BELOW`).
+* **Momentum:** `stoch_k` < `stoch_d` (`stoch_regime` = `K_BELOW_D`).
+* **Rule Signal:** `rule_signal` = `SHORT`.
+* **Forward Barrier:** Price reaches the $-1.5\times\text{ATR}$ lower barrier before hitting the upper stop barrier.
+
+---
+
+## 3. Mandatory `HOLD` Edge Cases
+The generator labels `HOLD` under the following market conditions:
+
+1. **Counter-Trend Conflicts:**
+   * Buying in a downtrend (`stoch_k` > `stoch_d` while `close` < `ema_200`).
+   * Shorting in an uptrend (`stoch_k` < `stoch_d` while `close` > `ema_200`).
+2. **Same-Bar Barrier Touches:**
+   * High and low within the lookahead horizon touch both the upper and lower ATR barriers in the same candle.
+3. **Horizon Expiration:**
+   * Price fails to touch either ATR barrier within the `--horizon` (default 24 bars) window.
+4. **Warmup / Incomplete Indicators:**
+   * Initial bars lacking a valid 200 EMA or 14 ATR calculation.
