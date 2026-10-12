@@ -1,4 +1,3 @@
-# quant-llm-engine
 # 🚀 Quant LLM Engine (`quant-llm-engine`)
 
 An institutional-grade algorithmic trading and backtesting engine driven by fine-tuned Large Language Models (Qwen LoRA adapters) combined with strict risk management controls and multi-timeframe structural gates.
