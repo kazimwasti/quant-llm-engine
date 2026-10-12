@@ -184,3 +184,7 @@ def latest_snapshot(df: pd.DataFrame) -> Optional[dict]:
         "signal",
     ]
     return {key: row[key] for key in keys if key in df.columns}
+
+def evaluate_signal(row, history):
+    # Your strategy logic here
+    return signal

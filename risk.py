@@ -36,9 +36,7 @@ class PlatformProfile:
     """Optional extra constraints layered under the universal 2.0% breaker."""
 
     name: Platform
-    # Extra dollar daily-loss cap used by some evaluations (None = percent only).
     daily_loss_usd: Optional[float] = None
-    # Trailing max-drawdown from peak equity (None = not enforced here).
     trailing_drawdown_usd: Optional[float] = None
     allow_overnight: bool = False
 
@@ -95,7 +93,6 @@ class PropFirmRiskManager:
             raise ValueError(
                 "per_trade_risk_pct must be > 0 and <= 2.0% hard daily cap"
             )
-        # Never allow a looser daily cap than the universal 2.0% breaker.
         self.daily_loss_limit_pct = min(self.daily_loss_limit_pct, DAILY_LOSS_LIMIT_PCT)
         if self.daily_loss_limit_pct <= 0:
             raise ValueError("daily_loss_limit_pct must be > 0")
@@ -125,13 +122,10 @@ class PropFirmRiskManager:
 
     @property
     def remaining_daily_budget(self) -> float:
-        # Budget is a positive dollar amount; daily_pnl is negative when losing.
-        # Open risk is treated as already committed against the breaker.
         unused = self.daily_loss_budget + min(self.daily_pnl, 0.0) - self.open_risk_dollars
         return max(0.0, unused)
 
     def reset_day(self, equity: Optional[float] = None) -> None:
-        """Start a new trading session (typically the platform RTH date)."""
         if equity is not None:
             if equity <= 0:
                 raise ValueError("equity must be > 0")
@@ -151,7 +145,6 @@ class PropFirmRiskManager:
         self._trip_if_breached()
 
     def register_pnl(self, pnl: float) -> None:
-        """Apply realized (or marked) P&L and re-check the circuit breaker."""
         self.equity += float(pnl)
         self.realized_daily_pnl += float(pnl)
         self.peak_equity = max(self.peak_equity, self.equity)
@@ -165,11 +158,6 @@ class PropFirmRiskManager:
         return self.halted
 
     def can_trade(self, additional_risk: float = 0.0) -> tuple[bool, str]:
-        """Whether a new order may be sent.
-
-        `additional_risk` is the dollar amount the new order would put at risk.
-        Combined with open risk it must not exhaust the remaining daily budget.
-        """
         self._trip_if_breached()
         if self.halted:
             return False, self.halt_reason
@@ -189,18 +177,6 @@ class PropFirmRiskManager:
         equity: Optional[float] = None,
         point_value: Optional[float] = None,
     ) -> PositionSize:
-        """Size a trade so stop-out loss ~= 0.5% of equity.
-
-        Parameters
-        ----------
-        stop_distance:
-            Absolute price distance from entry to stop (must be > 0).
-        equity:
-            Override mark used for the 0.5% calculation (defaults to live equity).
-        point_value:
-            Dollars per 1.0 price point per 1.0 quantity unit
-            (futures multiplier, FX pip value, or 1.0 for 1-share equity).
-        """
         if stop_distance <= 0:
             return PositionSize(
                 quantity=0.0,
@@ -280,7 +256,6 @@ class PropFirmRiskManager:
         )
 
     def reserve_open_risk(self, size: PositionSize) -> None:
-        """Book the planned dollar risk after an order is accepted."""
         if size.blocked or size.quantity <= 0:
             raise ValueError("cannot reserve risk for a blocked / empty size")
         allowed, reason = self.can_trade(additional_risk=size.risk_dollars)
@@ -313,3 +288,20 @@ class PropFirmRiskManager:
                     f"{self.platform.value} trailing drawdown {drawdown:.2f} "
                     f"reached cap {dd_cap:.2f}"
                 )
+
+
+class RiskManager(PropFirmRiskManager):
+    """Bridge alias so backtest.py can initialize RiskManager with account_balance."""
+    def __init__(self, account_balance=10000, **kwargs):
+        super().__init__(starting_equity=float(account_balance), **kwargs)
+
+    def check_risk(self, position_size, current_drawdown):
+        return not self.circuit_breaker_active()
+
+
+class ExecutionPayload:
+    def __init__(self, symbol, action, quantity, price):
+        self.symbol = symbol
+        self.action = action
+        self.quantity = quantity
+        self.price = price
