@@ -16,6 +16,11 @@ trades_log.csv
 equity_curve.csv
 data/safety-state.json
 data/safety-state.json.claims/
+data/5m_cloud.csv
+data/hourly_cloud.csv
+data/jev_train_5m.jsonl
+models/qwen_adapter/
+results/
 tests/quant-operations-*/
 
 # OS Files

@@ -82,3 +82,42 @@ Use `--ambiguous-fill-policy probabilistic` only for sensitivity analysis, not
 as the primary risk estimate. Compare configurations on chronological,
 untouched periods; do not select parameters from the same period used to report
 performance.
+
+### Prepare and compare a matched cloud run
+
+The checked-in `data/5m.csv` and `data/hourly.csv` are not a matched pair.
+Create fresh, disposable inputs instead (Yahoo Finance currently limits the
+5-minute interval to recent history; hourly history includes 180 calendar days
+of warmup):
+
+```powershell
+python scripts/prepare_cloud_data.py --symbol MNQ=F --test-days 50
+```
+
+Review the provider, symbol, timestamps, and date coverage before using the
+files. The downloader requires at least 200 hourly bars before the first 5m
+bar and writes timestamps in UTC. Provider data can be revised and is not a
+substitute for exchange-quality historical data.
+
+Run baseline and adapter with identical inputs, costs, and fill policy. The
+adapter command requires a locally available `models/qwen_adapter`; no adapter
+weights are included in this repository:
+
+```powershell
+python backtest/backtest.py --feature-fallback --input data/5m_cloud.csv --hourly-input data/hourly_cloud.csv --slippage-points 0.25 --commission-per-contract 2.50 --ambiguous-fill-policy conservative --output-prefix results/rule_baseline
+python backtest/backtest.py --adapter-dir models/qwen_adapter --input data/5m_cloud.csv --hourly-input data/hourly_cloud.csv --slippage-points 0.25 --commission-per-contract 2.50 --ambiguous-fill-policy conservative --output-prefix results/qwen_adapter
+python scripts/compare_backtests.py --run baseline=results/rule_baseline --run adapter=results/qwen_adapter --output results/comparison.csv
+```
+
+The comparison reports net P&L, drawdown, profit factor, trade count, win rate,
+and longest losing streak. It summarizes outputs; it does not establish an
+out-of-sample result. Freeze a chronological test window before comparing,
+keep it untouched during tuning, and rerun both models at higher slippage to
+measure cost sensitivity. The current adapter is loaded directly by PEFT; this
+repo does not implement a vLLM endpoint client. Do not start vLLM for this
+backtester.
+
+Do not upload the existing CSVs as a pair, and do not upload credentials or
+unreviewed data to a cloud volume. This repository does not provision a
+Runpod Pod, private remote, network volume, or account credentials. Create
+those in your own account after reviewing the inputs and expected spend.
