@@ -1,7 +1,8 @@
 """Deterministic historical simulator for intraday Jev strategy bars.
 
-Input is OHLC CSV (default expected interval: 5 minutes). OHLC-only intra-bar
-movement follows an explicit open/nearest-extreme path convention.
+Input is OHLC CSV (default expected interval: 5 minutes). Decisions are made
+from completed bars and fill at the next bar's open. OHLC-only intra-bar
+movement uses an explicit conservative ambiguity policy.
 """
 
 from __future__ import annotations
@@ -27,7 +28,12 @@ from core.engine import (
     extract_decision,
 )
 from core.risk import Platform, PropFirmRiskManager
-from core.strategy import DEFAULT_ATR_TARGET_MULTIPLIER, add_indicators, generate_signals
+from core.strategy import (
+    DEFAULT_ATR_TARGET_MULTIPLIER,
+    add_indicators,
+    align_higher_timeframe_ema,
+    generate_signals,
+)
 
 logger = logging.getLogger("Backtester")
 
@@ -44,6 +50,7 @@ class Simulator:
         commission_per_contract: float = 2.50,
         min_confidence: float = 0.65,
         ambiguous_stop_probability: float = 0.75,
+        ambiguous_fill_policy: str = "conservative",
         random_seed: int = 1729,
         backend=None,
         daily_profit_target: float | None = 1_000.0,
@@ -59,6 +66,8 @@ class Simulator:
             raise ValueError("tick_size must be positive")
         if not 0 <= min_confidence <= 1 or not 0 <= ambiguous_stop_probability <= 1:
             raise ValueError("confidence and ambiguous-stop probability must be between 0 and 1")
+        if ambiguous_fill_policy not in {"conservative", "probabilistic"}:
+            raise ValueError("ambiguous_fill_policy must be conservative or probabilistic")
         self.initial_balance = float(initial_balance)
         self.balance = float(initial_balance)
         self.symbol = symbol.upper()
@@ -68,6 +77,7 @@ class Simulator:
         self.tick_size = float(tick_size)
         self.min_confidence = float(min_confidence)
         self.ambiguous_stop_probability = float(ambiguous_stop_probability)
+        self.ambiguous_fill_policy = ambiguous_fill_policy
         self.rng = random.Random(random_seed)
         self.ambiguous_bars = 0
         self.ambiguous_stop_fills = 0
@@ -87,10 +97,18 @@ class Simulator:
             baseline_confidence=self.min_confidence,
         )
         self.position: dict | None = None
+        self.pending_order: dict | None = None
+        self.cancelled_pending_orders = 0
         self.trades: list[dict] = []
         self.equity_curve: list[dict] = []
 
-    def run_backtest(self, source: pd.DataFrame, *, output_prefix: str = "backtest") -> dict:
+    def run_backtest(
+        self,
+        source: pd.DataFrame,
+        *,
+        higher_timeframe: pd.DataFrame | None = None,
+        output_prefix: str = "backtest",
+    ) -> dict:
         required = {"open", "high", "low", "close"}
         missing = required.difference(source.columns)
         if missing:
@@ -98,44 +116,60 @@ class Simulator:
         if source.empty:
             raise ValueError("OHLC input has no rows")
 
-        df = generate_signals(add_indicators(source.reset_index(drop=True)))
-        if "timestamp" in source.columns:
-            timestamps = pd.to_datetime(source["timestamp"], errors="coerce")
+        intraday = source.reset_index(drop=True)
+        higher_timeframe_ema = None
+        if higher_timeframe is not None:
+            higher_timeframe_ema = align_higher_timeframe_ema(
+                intraday, higher_timeframe.reset_index(drop=True)
+            )
+            if not higher_timeframe_ema.notna().any():
+                raise ValueError(
+                    "no completed higher-timeframe EMA aligns with the intraday data; "
+                    "provide matching dates and enough hourly warmup history"
+                )
+        df = generate_signals(
+            add_indicators(intraday, higher_timeframe_ema=higher_timeframe_ema)
+        )
+        if "timestamp" in intraday.columns:
+            timestamps = pd.to_datetime(intraday["timestamp"], utc=True, errors="coerce")
         elif isinstance(source.index, pd.DatetimeIndex):
             timestamps = pd.Series(source.index, index=source.index).reset_index(drop=True)
         else:
             timestamps = pd.Series(range(len(df)))
 
         previous_session = None
-        for i, row in df.iterrows():
-            ts = timestamps.iloc[i]
+        timestamp_values = tuple(timestamps)
+        for i, row in enumerate(df.itertuples(index=False)):
+            ts = timestamp_values[i]
             local_ts = ts.tz_convert("America/New_York") if pd.notna(ts) and getattr(ts, "tzinfo", None) else ts
             session = (local_ts - pd.Timedelta(hours=18)).date() if pd.notna(local_ts) and hasattr(local_ts, "date") else None
             if previous_session is not None and session is not None and session != previous_session:
+                self._cancel_pending_order("session_end")
                 if self.position is not None:
-                    self._close(float(row["open"]), "session_end", ts)
+                    self._close(float(row.open), "session_end", ts)
                 self.risk_manager.reset_day(self.balance)
             if session is not None:
                 previous_session = session
             local_minute = local_ts.hour * 60 + local_ts.minute if pd.notna(local_ts) and hasattr(local_ts, "hour") else 0
             session_elapsed = min(1.0, ((local_minute - 18 * 60) % (24 * 60)) / (23 * 60))
             self.risk_manager.session_progress = session_elapsed
+            self._activate_pending_order(row, ts)
 
-            if pd.isna(row["ema_200"]) or pd.isna(row["atr_14"]) or row["atr_14"] <= 0:
+            if pd.isna(row.ema_200) or pd.isna(row.atr_14) or row.atr_14 <= 0:
                 continue
 
             state = MarketState(
-                close=float(row["close"]), ema_200=float(row["ema_200"]),
-                stoch_k=float(row["stoch_k"]), stoch_d=float(row["stoch_d"]),
-                atr_14=float(row["atr_14"]), long_stop=float(row["long_stop"]),
-                short_stop=float(row["short_stop"]), signal=int(row["signal"]),
-                session_allowed=bool(row["session_allowed"]),
-                volatility_active=bool(row["volatility_active"]),
-                expected_drift=float(row["ema_drift"]),
-                session_progress=float(row["session_progress"]),
-                htf_ema=float(row["htf_ema"]),
-                long_structure_confirmed=bool(row["long_structure_confirmed"]),
-                short_structure_confirmed=bool(row["short_structure_confirmed"]),
+                close=float(row.close), ema_200=float(row.ema_200),
+                stoch_k=float(row.stoch_k), stoch_d=float(row.stoch_d),
+                atr_14=float(row.atr_14), long_stop=float(row.long_stop),
+                short_stop=float(row.short_stop), signal=int(row.signal),
+                session_allowed=bool(row.session_allowed),
+                volatility_active=bool(row.volatility_active),
+                expected_drift=float(row.ema_drift),
+                session_progress=float(row.session_progress),
+                htf_ema=float(row.htf_ema),
+                long_structure_confirmed=bool(row.long_structure_confirmed),
+                short_structure_confirmed=bool(row.short_structure_confirmed),
             )
             decision_due = self.deviation_trigger.observe(state)
 
@@ -143,15 +177,19 @@ class Simulator:
             equity = self.balance
             if self.position:
                 direction = 1 if self.position["action"] == "BUY" else -1
-                equity += (float(row["close"]) - self.position["entry"]) * direction * self.position["quantity"] * self.point_value
+                equity += (float(row.close) - self.position["entry"]) * direction * self.position["quantity"] * self.point_value
             self.risk_manager.mark_equity(max(equity, 0.0))
             if self.risk_manager.circuit_breaker_active() and self.position is not None:
-                self._close(float(row["close"]), "circuit_breaker", ts)
+                self._close(float(row.close), "circuit_breaker", ts)
                 equity = self.balance
             self.equity_curve.append({"timestamp": ts, "balance": self.balance, "equity": equity,
                                       "position": self.position["action"] if self.position else "FLAT"})
 
-            if self.position is None and not self.risk_manager.circuit_breaker_active():
+            if (
+                self.position is None
+                and self.pending_order is None
+                and not self.risk_manager.circuit_breaker_active()
+            ):
                 if not decision_due:
                     self.skipped_evaluations += 1
                     continue
@@ -174,35 +212,60 @@ class Simulator:
                 )
                 if payload.approved and payload.size is not None:
                     self.risk_manager.reserve_open_risk(payload.size)
-                    fill_entry = float(row["close"]) + (
-                        self.slippage_points if payload.action == "BUY" else -self.slippage_points
-                    )
-                    stop_distance = payload.stop_distance
-                    self.position = {
+                    self.pending_order = {
                         "action": payload.action, "quantity": int(payload.quantity),
-                        "entry": fill_entry,
-                        "stop": fill_entry + (-stop_distance if payload.action == "BUY" else stop_distance),
                         "risk_dollars": payload.risk_dollars,
-                        "target": fill_entry + (
-                            DEFAULT_ATR_TARGET_MULTIPLIER * float(row["atr_14"])
-                            if payload.action == "BUY"
-                            else -DEFAULT_ATR_TARGET_MULTIPLIER * float(row["atr_14"])
-                        ),
-                        "entry_atr": float(row["atr_14"]),
-                        "breakeven_active": False,
-                        "entry_time": ts,
+                        "stop_distance": payload.stop_distance,
+                        "target_distance": DEFAULT_ATR_TARGET_MULTIPLIER * float(row.atr_14),
+                        "entry_atr": float(row.atr_14),
+                        "signal_time": ts,
                     }
 
         if self.position is not None:
             last = df.iloc[-1]
-            self._close(float(last["close"]), "end_of_data", timestamps.iloc[-1])
+            self._close(float(last["close"]), "end_of_data", timestamp_values[-1])
+        self._cancel_pending_order("end_of_data")
         return self._write_results(output_prefix)
 
-    def _manage_position(self, row: pd.Series, timestamp) -> None:
+    def _activate_pending_order(self, row, timestamp) -> None:
+        """Fill an approved completed-bar signal on the following bar's open."""
+        pending = self.pending_order
+        if pending is None:
+            return
+        fill_entry = float(row.open) + (
+            self.slippage_points if pending["action"] == "BUY" else -self.slippage_points
+        )
+        is_long = pending["action"] == "BUY"
+        stop_distance = pending["stop_distance"]
+        target_distance = pending["target_distance"]
+        self.position = {
+            "action": pending["action"],
+            "quantity": pending["quantity"],
+            "entry": fill_entry,
+            "stop": fill_entry + (-stop_distance if is_long else stop_distance),
+            "risk_dollars": pending["risk_dollars"],
+            "target": fill_entry + (target_distance if is_long else -target_distance),
+            "entry_atr": pending["entry_atr"],
+            "breakeven_active": False,
+            "entry_time": timestamp,
+            "signal_time": pending["signal_time"],
+        }
+        self.pending_order = None
+
+    def _cancel_pending_order(self, reason: str) -> None:
+        """Release risk for a signal that never received a next-bar fill."""
+        if self.pending_order is None:
+            return
+        self.risk_manager.release_open_risk(self.pending_order["risk_dollars"])
+        self.pending_order = None
+        self.cancelled_pending_orders += 1
+        logger.info("Cancelled pending order: %s", reason)
+
+    def _manage_position(self, row, timestamp) -> None:
         if self.position is None:
             return
         p = self.position
-        o, h, l, c = (float(row[name]) for name in ("open", "high", "low", "close"))
+        o, h, l, c = (float(getattr(row, name)) for name in ("open", "high", "low", "close"))
         is_long = p["action"] == "BUY"
         if (is_long and o <= p["stop"]) or (not is_long and o >= p["stop"]):
             self._close(o, "breakeven" if p["breakeven_active"] else "stop", timestamp)
@@ -226,6 +289,11 @@ class Simulator:
             )
             p["breakeven_active"] = True
             p["breakeven_time"] = timestamp
+        stop_touched = l <= p["stop"] if is_long else h >= p["stop"]
+        target_touched = h >= p["target"] if is_long else l <= p["target"]
+        if stop_touched and target_touched:
+            self._resolve_ambiguous_bar(p, timestamp)
+            return
         for start, end in zip(path, path[1:]):
             if is_long:
                 if end > start:
@@ -255,9 +323,13 @@ class Simulator:
                     return
 
     def _resolve_ambiguous_bar(self, position: dict, timestamp) -> None:
-        """Resolve a both-barriers bar with reproducible probabilistic fills."""
+        """Resolve both-barrier OHLC bars without assuming favorable tick order."""
         self.ambiguous_bars += 1
-        stop_fill = self.rng.random() < self.ambiguous_stop_probability
+        stop_fill = (
+            True
+            if self.ambiguous_fill_policy == "conservative"
+            else self.rng.random() < self.ambiguous_stop_probability
+        )
         self.ambiguous_stop_fills += int(stop_fill)
         if position["action"] == "BUY":
             price = position["stop"] if stop_fill else position["target"]
@@ -287,6 +359,7 @@ class Simulator:
                             "fees": fees, "reason": reason,
                             "breakeven_active": p["breakeven_active"],
                             "breakeven_time": p.get("breakeven_time"),
+                            "signal_time": p.get("signal_time"),
                             "balance": self.balance})
         self.position = None
 
@@ -315,6 +388,7 @@ class Simulator:
             "ambiguous_bars": self.ambiguous_bars,
             "ambiguous_stop_fills": self.ambiguous_stop_fills,
             "ambiguous_stop_probability": self.ambiguous_stop_probability,
+            "ambiguous_fill_policy": self.ambiguous_fill_policy,
             "min_confidence": self.min_confidence,
             "backend": "qwen_lora" if self.backend is not None else "feature_fallback",
             "model_evaluations": self.evaluations,
@@ -323,6 +397,7 @@ class Simulator:
             "required_confidence_now": self.risk_manager.required_confidence(),
             "consecutive_stopouts": self.risk_manager.consecutive_stopouts,
             "breakeven_exits": int((trades.get("reason", pd.Series(dtype=str)) == "breakeven").sum()),
+            "cancelled_pending_orders": self.cancelled_pending_orders,
         }
         if not equity.empty:
             peak = equity["equity"].cummax()
@@ -335,7 +410,7 @@ class Simulator:
 def _read_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
     return df
 
@@ -381,6 +456,13 @@ def _load_lora_backend(adapter_dir: str) -> TorchSequenceClassifierBackend:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest the Jev strategy on intraday OHLC bars")
     parser.add_argument("--input", default="data/5m.csv", help="OHLC CSV (default: data/5m.csv)")
+    parser.add_argument(
+        "--hourly-input",
+        help=(
+            "Completed hourly OHLC CSV for the higher-timeframe gate. "
+            "Values are aligned only after their hourly bar has closed."
+        ),
+    )
     parser.add_argument("--balance", type=float, default=50_000.0)
     parser.add_argument("--symbol", choices=("MNQ", "NQ"), help="Contract sizing symbol (inferred from CSV if omitted)")
     parser.add_argument("--point-value", type=float, help="Dollars per index point (defaults: MNQ=2, NQ=20)")
@@ -398,7 +480,13 @@ def main() -> None:
     backend_group.add_argument("--feature-fallback", action="store_true",
                                help="Use the handcrafted scorer for diagnostics, not Qwen validation")
     parser.add_argument("--ambiguous-stop-probability", type=float, default=0.75,
-                        help="Probability ambiguous both-barrier bar fills at stop")
+                        help="Probability an ambiguous both-barrier bar fills at stop (probabilistic policy only)")
+    parser.add_argument(
+        "--ambiguous-fill-policy",
+        choices=("conservative", "probabilistic"),
+        default="conservative",
+        help="Both-barrier OHLC fill policy; conservative assumes the stop fills first",
+    )
     parser.add_argument("--random-seed", type=int, default=1729)
     parser.add_argument("--platform", choices=[p.value for p in Platform], default=Platform.GENERIC.value)
     parser.add_argument("--output-prefix", default="data/backtest")
@@ -411,6 +499,18 @@ def main() -> None:
     if not path.is_file():
         parser.error(f"input file does not exist: {path}")
     data = _read_csv(path)
+    hourly_data = None
+    if args.hourly_input:
+        hourly_path = Path(args.hourly_input)
+        if not hourly_path.is_absolute():
+            hourly_path = PROJECT_ROOT / hourly_path
+        if not hourly_path.is_file():
+            parser.error(f"hourly input file does not exist: {hourly_path}")
+        hourly_data = _read_csv(hourly_path)
+        try:
+            _validate_interval(hourly_data, 60)
+        except ValueError as exc:
+            parser.error(str(exc))
     csv_symbol = str(data["symbol"].iloc[0]).upper() if "symbol" in data.columns else "MNQ=F"
     inferred_symbol = "NQ" if csv_symbol.startswith("NQ") and not csv_symbol.startswith("MNQ") else "MNQ"
     symbol = args.symbol or inferred_symbol
@@ -431,13 +531,14 @@ def main() -> None:
                     commission_per_contract=args.commission_per_contract,
                     min_confidence=args.min_confidence,
                     ambiguous_stop_probability=args.ambiguous_stop_probability,
+                    ambiguous_fill_policy=args.ambiguous_fill_policy,
                     random_seed=args.random_seed,
                     backend=backend,
                     daily_profit_target=daily_target,
                     deviation_horizon=args.deviation_horizon,
                     deviation_envelope_atr=args.deviation_envelope_atr)
     _validate_interval(data, args.bar_minutes)
-    sim.run_backtest(data, output_prefix=args.output_prefix)
+    sim.run_backtest(data, higher_timeframe=hourly_data, output_prefix=args.output_prefix)
 
 
 if __name__ == "__main__":

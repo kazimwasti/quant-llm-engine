@@ -43,3 +43,42 @@ quant-llm-engine/
 │   ├── dataset_generator.py   # Synthesizes JSONL instruction datasets
 │   ├── download_data.py        # Historical data fetching pipelines
 │   └── train_lora.py           # PEFT / QLoRA 4-bit fine-tuning script
+└── tests/                      # Offline operational-safety acceptance tests
+```
+
+## Operational test readiness
+
+`core.operations.PaperTradingSafetyController` is the broker-facing safety
+boundary for the Phase F operational tests. It starts disconnected, permits
+paper trading only, persists order IDs and session safety locks across restarts,
+and requires a manual reset after account reconciliation.
+
+Run the offline operational suite before a paper-trading deployment:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+Copy `.env.example` to `.env` only on the paper-trading host and keep real
+credentials out of Git. See `OPERATIONS_TEST_PLAN.md` for the practice-account
+restart, disconnect, flatten, and risk-limit checklist.
+
+## Conservative cloud backtests
+
+Use matching, completed 5-minute and hourly histories from the same instrument
+and date range. The hourly EMA is made available only after that hourly bar
+closes, decisions fill at the next 5-minute open with adverse slippage, and a
+bar that touches both stop and target is charged to the stop by default.
+
+```powershell
+python backtest/backtest.py --feature-fallback `
+  --input data/5m.csv --hourly-input data/hourly.csv `
+  --slippage-points 0.25 --commission-per-contract 2.50 `
+  --ambiguous-fill-policy conservative --output-prefix results/cloud-baseline
+```
+
+Use `--ambiguous-fill-policy probabilistic` only for sensitivity analysis, not
+as the primary risk estimate. Compare configurations on chronological,
+untouched periods; do not select parameters from the same period used to report
+performance.

@@ -137,6 +137,61 @@ def dynamic_stop_loss(
     raise ValueError("side must be 'long' or 'short'")
 
 
+def align_higher_timeframe_ema(
+    intraday: pd.DataFrame,
+    higher_timeframe: pd.DataFrame,
+    *,
+    ema_period: int = EMA_PERIOD,
+    timestamp_column: str = "timestamp",
+) -> pd.Series:
+    """Align a completed higher-timeframe EMA to intraday bars without leakage.
+
+    A higher-timeframe bar stamped at 10:00 is assumed to contain prices from
+    10:00 up to (but not including) 11:00. Its close-derived EMA only becomes
+    available at 11:00. ``merge_asof`` then carries the most recently completed
+    value forward, never a still-forming hourly bar.
+    """
+    if ema_period < 1:
+        raise ValueError("ema_period must be >= 1")
+    _require_columns(intraday, (timestamp_column,))
+    _require_columns(higher_timeframe, (timestamp_column, "close"))
+
+    left = pd.DataFrame(
+        {"_timestamp": pd.to_datetime(intraday[timestamp_column], utc=True, errors="coerce")},
+        index=intraday.index,
+    )
+    right = pd.DataFrame(
+        {
+            "_timestamp": pd.to_datetime(higher_timeframe[timestamp_column], utc=True, errors="coerce"),
+            "close": pd.to_numeric(higher_timeframe["close"], errors="coerce"),
+        }
+    ).dropna()
+    if left["_timestamp"].isna().any():
+        raise ValueError("intraday timestamps must be valid")
+    right = right.sort_values("_timestamp").drop_duplicates("_timestamp", keep="last")
+    if len(right) < 2:
+        raise ValueError("higher_timeframe requires at least two timestamped bars")
+
+    intervals = right["_timestamp"].diff().dropna()
+    bar_duration = intervals.median()
+    if pd.isna(bar_duration) or bar_duration <= pd.Timedelta(0):
+        raise ValueError("higher_timeframe timestamps must be strictly increasing")
+
+    right["htf_ema"] = right["close"].ewm(
+        span=ema_period, adjust=False, min_periods=ema_period
+    ).mean()
+    right["_available_at"] = right["_timestamp"] + bar_duration
+    merged = pd.merge_asof(
+        left.reset_index().sort_values("_timestamp"),
+        right[["_available_at", "htf_ema"]].sort_values("_available_at"),
+        left_on="_timestamp",
+        right_on="_available_at",
+        direction="backward",
+        allow_exact_matches=True,
+    ).set_index("index")
+    return merged.reindex(intraday.index)["htf_ema"].rename("htf_ema")
+
+
 def add_indicators(
     df: pd.DataFrame,
     ema_period: int = EMA_PERIOD,
@@ -147,6 +202,7 @@ def add_indicators(
     atr_target_multiplier: float = DEFAULT_ATR_TARGET_MULTIPLIER,
     atr_regime_window: int = ATR_REGIME_WINDOW,
     market_timezone: str = MARKET_TIMEZONE,
+    higher_timeframe_ema: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """Return a copy of `df` with strategy columns attached.
 
@@ -158,11 +214,18 @@ def add_indicators(
     out = df.copy()
     out["ema_200"] = ema(out["close"], period=ema_period)
     out["ema_drift"] = out["ema_200"].diff(3) / 3.0
-    out["htf_ema"] = out["close"].astype(float).ewm(
-        span=HTF_EMA_PERIOD_5M,
-        adjust=False,
-        min_periods=HTF_EMA_PERIOD_5M,
-    ).mean()
+    if higher_timeframe_ema is None:
+        # Fallback for single-timeframe datasets. A true hourly input should
+        # use ``align_higher_timeframe_ema`` and pass the resulting series.
+        out["htf_ema"] = out["close"].astype(float).ewm(
+            span=HTF_EMA_PERIOD_5M,
+            adjust=False,
+            min_periods=HTF_EMA_PERIOD_5M,
+        ).mean()
+    else:
+        if not higher_timeframe_ema.index.equals(out.index):
+            raise ValueError("higher_timeframe_ema index must match the intraday frame")
+        out["htf_ema"] = pd.to_numeric(higher_timeframe_ema, errors="coerce")
     out["stoch_k"], out["stoch_d"] = stochastic(
         out["high"],
         out["low"],

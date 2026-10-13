@@ -14,6 +14,9 @@ __pycache__/
 # Backtest Output / Local Test Logs
 trades_log.csv
 equity_curve.csv
+data/safety-state.json
+data/safety-state.json.claims/
+tests/quant-operations-*/
 
 # OS Files
 .DS_Store

@@ -29,8 +29,6 @@ from .strategy import (
     add_indicators,
     generate_signals,
     latest_snapshot,
-    atr_envelope_widths,
-    discrete_expected_checkpoints,
 )
 
 ACTIONS = ("BUY", "SELL", "HOLD")
@@ -384,32 +382,27 @@ class DiscreteDeviationTrigger:
             raise ValueError("horizon and envelope_atr_multiplier must be positive")
         self.horizon = horizon
         self.envelope_atr_multiplier = envelope_atr_multiplier
-        self.expected: list[float] = []
-        self.widths: list[float] = []
+        self.anchor_close = math.nan
+        self.anchor_drift = 0.0
         self.checkpoint = 0
         self.last_deviation_atr = 0.0
 
     def _arm(self, state: MarketState) -> None:
         drift = state.expected_drift if math.isfinite(state.expected_drift) else 0.0
-        self.expected = discrete_expected_checkpoints(state.close, drift, self.horizon)
-        self.widths = atr_envelope_widths(
-            state.atr_14, self.horizon, self.envelope_atr_multiplier
-        ) if state.atr_14 > 0 else []
+        self.anchor_close = state.close
+        self.anchor_drift = drift
         self.checkpoint = 0
 
     def observe(self, state: MarketState) -> bool:
         if not state.is_complete():
             return False
-        if not self.expected:
+        if not math.isfinite(self.anchor_close):
             self._arm(state)
             return True
         self.checkpoint += 1
-        i = min(self.checkpoint, self.horizon) - 1
-        expected = self.expected[i]
-        self.widths = atr_envelope_widths(
-            state.atr_14, self.horizon, self.envelope_atr_multiplier
-        )
-        width = self.widths[i]
+        step = min(self.checkpoint, self.horizon)
+        expected = self.anchor_close + self.anchor_drift * step
+        width = state.atr_14 * self.envelope_atr_multiplier * math.sqrt(step)
         self.last_deviation_atr = abs(state.close - expected) / max(state.atr_14, 1e-12)
         deviated = abs(state.close - expected) > width
         expired = self.checkpoint >= self.horizon
