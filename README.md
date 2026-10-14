@@ -83,6 +83,24 @@ as the primary risk estimate. Compare configurations on chronological,
 untouched periods; do not select parameters from the same period used to report
 performance.
 
+### Generate and train the Qwen classifier
+
+Build the JSONL from matching 5-minute/hourly files. The generator requires
+200 hourly warmup bars and caps directional labels at 40% of the output while
+retaining every HOLD row:
+
+```powershell
+python scripts/dataset_generator.py --input data/5m_cloud.csv --hourly-input data/hourly_cloud.csv --output data/jev_train_5m.jsonl
+python scripts/train_lora.py --data data/jev_train_5m.jsonl --output-dir models/qwen_adapter
+```
+
+The generator labels BUY/SELL only when a matching strategy signal and regime
+gates are active and the 2.2x ATR target is reached before the 1.0x ATR stop;
+ambiguous same-bar touches resolve stop-first. QLoRA evaluation uses the final
+chronological segment with a purge at least as large as the label horizon, and
+logs validation cross-entropy plus per-class precision/recall/support. These
+are research diagnostics, not guarantees of live or out-of-sample performance.
+
 ### Prepare and compare a matched cloud run
 
 The checked-in `data/5m.csv` and `data/hourly.csv` are not a matched pair.

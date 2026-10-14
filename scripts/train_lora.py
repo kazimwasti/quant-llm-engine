@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--eval-ratio", type=float, default=0.05)
+    parser.add_argument("--purge-bars", type=int, default=0,
+                        help="Extra chronological gap before validation; actual purge is at least the label horizon")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -64,8 +66,10 @@ def main() -> None:
 
     if args.max_length < 8 or args.batch_size < 1 or args.gradient_accumulation_steps < 1:
         raise ValueError("max_length, batch_size, and gradient accumulation must be positive")
-    if not 0 <= args.eval_ratio < 1:
-        raise ValueError("eval_ratio must be in [0, 1)")
+    if not 0 < args.eval_ratio < 1:
+        raise ValueError("eval_ratio must be > 0 and < 1 to report validation metrics")
+    if args.purge_bars < 0:
+        raise ValueError("purge_bars cannot be negative")
     data_path = Path(args.data)
     if not data_path.is_absolute():
         data_path = PROJECT_ROOT / data_path
@@ -92,29 +96,84 @@ def main() -> None:
     if "meta" not in dataset.column_names:
         raise ValueError("JSONL needs meta barrier metadata from dataset_generator.py")
 
-    # Fail fast on legacy or incompatible training files: prompts need the HTF
-    # regime feature and labels must carry the same asymmetric barriers used by
-    # the current strategy/backtest.
-    for row in dataset.select(range(min(len(dataset), 100))):
+    if len(dataset) < 20:
+        raise ValueError("Need at least 20 valid labeled rows for a chronological train/validation split")
+
+    # Validate every record. Directional labels must attest to a target-first
+    # outcome; HOLD remains the label for stops, timeouts, and blocked regimes.
+    previous_bar_index = -1
+    maximum_horizon = 0
+    for row in dataset:
         if "htf_ema=" not in row["prompt"]:
             raise ValueError("Training prompts lack the htf_ema feature; regenerate with dataset_generator.py")
+        for required_prompt_text in (
+            "minimum 2.2x ATR profit target",
+            "matching rule signal",
+            "choose HOLD",
+        ):
+            if required_prompt_text not in row["prompt"]:
+                raise ValueError("Training prompt lacks the current strategy objective; regenerate the JSONL")
         meta = row["meta"]
         if (abs(float(meta.get("stop_atr_multiplier", -1)) - 1.0) > 1e-9
                 or abs(float(meta.get("target_atr_multiplier", -1)) - 2.2) > 1e-9):
             raise ValueError("Training data must use 1.0x ATR stops and 2.2x ATR targets")
+        bar_index = int(meta.get("bar_index", -1))
+        if bar_index <= previous_bar_index:
+            raise ValueError("JSONL rows must be in strictly increasing chronological bar_index order")
+        previous_bar_index = bar_index
+        maximum_horizon = max(maximum_horizon, int(meta.get("horizon", 0)))
+        label = str(row["action"]).upper()
+        if label not in LABEL2ID:
+            raise ValueError(f"Unknown class label {label!r}; expected BUY, SELL, or HOLD")
+        if label in {"BUY", "SELL"} and meta.get("reason") != f"{label.lower()}_target_before_stop":
+            raise ValueError(f"{label} row is not marked as a target-before-stop outcome")
+
+    eval_start = max(1, int(len(dataset) * (1.0 - args.eval_ratio)))
+    if eval_start >= len(dataset):
+        eval_start = len(dataset) - 1
+    eval_rows = dataset.select(range(eval_start, len(dataset)))
+    eval_first_bar = int(eval_rows[0]["meta"]["bar_index"])
+    purge = max(args.purge_bars, maximum_horizon)
+    train_end = eval_start
+    while train_end > 0 and int(dataset[train_end - 1]["meta"]["bar_index"]) >= eval_first_bar - purge:
+        train_end -= 1
+    if train_end < 10 or len(eval_rows) < 2:
+        raise ValueError(
+            f"Chronological split leaves too little data after a {purge}-bar purge "
+            f"(train={train_end}, validation={len(eval_rows)}); provide more history or reduce the horizon."
+        )
+    train_dataset = dataset.select(range(train_end))
+    eval_dataset = eval_rows
 
     def encode_batch(batch):
         enc = tokenizer(batch["prompt"], truncation=True, max_length=args.max_length)
-        enc["labels"] = [LABEL2ID.get(str(label).upper(), -1) for label in batch["action"]]
+        enc["labels"] = [LABEL2ID[str(label).upper()] for label in batch["action"]]
         return enc
 
-    dataset = dataset.map(encode_batch, batched=True, remove_columns=dataset.column_names)
-    dataset = dataset.filter(lambda row: row["labels"] >= 0)
-    if len(dataset) < 10:
-        raise ValueError("Need at least 10 valid labeled rows to train and evaluate")
-    split = dataset.train_test_split(test_size=args.eval_ratio, seed=args.seed) if args.eval_ratio else None
-    train_dataset = split["train"] if split else dataset
-    eval_dataset = split["test"] if split else None
+    source_columns = dataset.column_names
+    train_dataset = train_dataset.map(encode_batch, batched=True, remove_columns=source_columns)
+    eval_dataset = eval_dataset.map(encode_batch, batched=True, remove_columns=source_columns)
+
+    def compute_metrics(eval_pred):
+        import numpy as np
+
+        logits = eval_pred.predictions[0] if isinstance(eval_pred.predictions, tuple) else eval_pred.predictions
+        predicted = np.asarray(logits).argmax(axis=-1)
+        labels = np.asarray(eval_pred.label_ids)
+        metrics = {}
+        f1_values = []
+        for class_id, class_name in ID2LABEL.items():
+            true_positive = int(((predicted == class_id) & (labels == class_id)).sum())
+            predicted_count = int((predicted == class_id).sum())
+            support = int((labels == class_id).sum())
+            precision = true_positive / predicted_count if predicted_count else 0.0
+            recall = true_positive / support if support else 0.0
+            metrics[f"{class_name.lower()}_precision"] = precision
+            metrics[f"{class_name.lower()}_recall"] = recall
+            metrics[f"{class_name.lower()}_support"] = support
+            f1_values.append(2 * precision * recall / (precision + recall) if precision + recall else 0.0)
+        metrics["macro_f1"] = float(np.mean(f1_values))
+        return metrics
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     quantization = BitsAndBytesConfig(
@@ -183,8 +242,13 @@ def main() -> None:
         eval_dataset=eval_dataset,
         data_collator=DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8),
         processing_class=tokenizer,
+        compute_metrics=compute_metrics,
     )
     trainer.train()
+    validation_metrics = trainer.evaluate()
+    print("Validation metrics (eval_loss is cross-entropy):")
+    for name, value in sorted(validation_metrics.items()):
+        print(f"  {name}: {value}")
     output = Path(args.output_dir)
     if not output.is_absolute():
         output = PROJECT_ROOT / output

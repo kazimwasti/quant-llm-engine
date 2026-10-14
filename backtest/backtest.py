@@ -170,6 +170,8 @@ class Simulator:
                 htf_ema=float(row.htf_ema),
                 long_structure_confirmed=bool(row.long_structure_confirmed),
                 short_structure_confirmed=bool(row.short_structure_confirmed),
+                bullish_rejection=bool(row.bullish_rejection),
+                bearish_rejection=bool(row.bearish_rejection),
             )
             decision_due = self.deviation_trigger.observe(state)
 

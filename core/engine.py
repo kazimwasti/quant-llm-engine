@@ -62,6 +62,8 @@ class MarketState:
     htf_ema: float = math.nan
     long_structure_confirmed: bool = False
     short_structure_confirmed: bool = False
+    bullish_rejection: bool = False
+    bearish_rejection: bool = False
 
     @property
     def ema_status(self) -> str:
@@ -158,12 +160,22 @@ def ingest_market_state(df: pd.DataFrame) -> MarketState:
         htf_ema=float(snapshot.get("htf_ema", math.nan)),
         long_structure_confirmed=bool(snapshot.get("long_structure_confirmed", False)),
         short_structure_confirmed=bool(snapshot.get("short_structure_confirmed", False)),
+        bullish_rejection=bool(snapshot.get("bullish_rejection", False)),
+        bearish_rejection=bool(snapshot.get("bearish_rejection", False)),
     )
 
 
 def format_decision_prompt(state: MarketState) -> str:
-    """Discrete Jev-style prompt. Next token is expected to be BUY|SELL|HOLD."""
+    """Constrained strategy prompt. Next token is expected to be BUY|SELL|HOLD."""
     return (
+        "Strategy objective and hard decision rules:\n"
+        "- Only consider setups with a 1.0x ATR stop and a minimum 2.2x ATR profit target (at least 1:2.2 reward-to-risk).\n"
+        "- A directional entry requires the matching rule signal, confirmed structure, and higher-timeframe trend alignment.\n"
+        "- Structural confirmation can include a directional rejection wick or a qualifying EMA/ATR pullback.\n"
+        "- Session and volatility regimes must both be active.\n"
+        "- If any requirement is missing, the regime is choppy/low-conviction, or evidence is ambiguous, choose HOLD.\n"
+        "- These rules are constraints, not a promise of any win rate or return.\n"
+        "\n"
         "State:\n"
         f"close={state.close:.6f}\n"
         f"ema_200={state.ema_200:.6f}\n"
@@ -180,6 +192,8 @@ def format_decision_prompt(state: MarketState) -> str:
         f"volatility_active={int(state.volatility_active)}\n"
         f"long_structure_confirmed={int(state.long_structure_confirmed)}\n"
         f"short_structure_confirmed={int(state.short_structure_confirmed)}\n"
+        f"bullish_rejection={int(state.bullish_rejection)}\n"
+        f"bearish_rejection={int(state.bearish_rejection)}\n"
         f"long_stop={state.long_stop:.6f}\n"
         f"short_stop={state.short_stop:.6f}\n"
         f"rule_signal={state.rule_signal}\n"
@@ -350,6 +364,11 @@ def extract_decision(
     ):
         action = "HOLD"
         source = f"{source}+htf_blocked"
+    if (action == "BUY" and (state.signal != 1 or not state.long_structure_confirmed)) or (
+        action == "SELL" and (state.signal != -1 or not state.short_structure_confirmed)
+    ):
+        action = "HOLD"
+        source = f"{source}+structure_or_signal_blocked"
     if not state.is_complete():
         action = "HOLD"
         source = f"{source}+incomplete_state"
