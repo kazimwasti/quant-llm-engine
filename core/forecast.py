@@ -134,10 +134,18 @@ def _nelder_mead(
 
 
 def _unconstrain(p: np.ndarray) -> tuple[float, float, float]:
-    """Map unconstrained coordinates to (omega, alpha, beta) with alpha+beta<1."""
-    omega = math.exp(float(p[0]))
-    a = math.exp(float(p[1]))
-    b = math.exp(float(p[2]))
+    """Map unconstrained coordinates to (omega, alpha, beta) with alpha+beta<1.
+
+    Coordinates are clamped to [-60, 60] before exponentiation: the simplex
+    can wander far out on flat/degenerate surfaces and math.exp overflows
+    past ~709, which would crash the optimizer mid-fit.
+    """
+    p0 = min(max(float(p[0]), -60.0), 60.0)
+    p1 = min(max(float(p[1]), -60.0), 60.0)
+    p2 = min(max(float(p[2]), -60.0), 60.0)
+    omega = math.exp(p0)
+    a = math.exp(p1)
+    b = math.exp(p2)
     z = 1.0 + a + b
     return omega, a / z, b / z
 
@@ -181,7 +189,11 @@ def fit_garch11(
     long_run = sample_var
     alpha0, beta0 = 0.08, 0.82
     omega0 = long_run * (1.0 - alpha0 - beta0)
-    if warm_start is not None and len(warm_start) == 3:
+    if (
+        warm_start is not None
+        and len(warm_start) == 3
+        and all(math.isfinite(float(v)) and abs(float(v)) <= 30.0 for v in warm_start)
+    ):
         p0 = np.array(warm_start, dtype=float)
     else:
         p0 = np.array([math.log(omega0), math.log(0.8), math.log(8.2)])
