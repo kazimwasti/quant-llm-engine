@@ -39,11 +39,17 @@ print(f'manager dataset OK: {len(rows)} rows, {scored} scored')
     --epochs 4
 
 # ---------------------------------------------------------------------------
-# Arm 1: the decision sub-agent. Same committed pipeline the README documents.
+# Arm 1: the decision sub-agent. The committed jev_train_5m.jsonl predates
+# the current prompt format (train_lora.py rejects it), so regenerate the
+# training set from a fresh matched 5m/hourly pair, then train.
 # ---------------------------------------------------------------------------
 if TRAIN_DECISION_LLM:
+    !python scripts/prepare_cloud_data.py --symbol MNQ=F --test-days 50
+    !python scripts/dataset_generator.py \
+        --input data/5m_cloud.csv --hourly-input data/hourly_cloud.csv \
+        --output data/jev_train_cloud.jsonl
     !python scripts/train_lora.py \
-        --data data/jev_train_5m.jsonl \
+        --data data/jev_train_cloud.jsonl \
         --output-dir models/qwen_adapter \
         --epochs 3
 
