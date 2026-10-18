@@ -1,0 +1,5 @@
+provider,source_type,coverage,access_and_license_note,link,role
+CME DataMine,exchange primary source,CME Group futures and options historical data,Confirm current product coverage price and redistribution/use license before purchase,https://www.cmegroup.com/datamine.html,Preferred first-party source
+Databento,commercial market-data vendor,CME Globex and other venues depending on dataset/schema,Usage/subscription pricing and redistribution terms apply; verify symbols and depth/time coverage,https://databento.com/docs/api-reference-historical,Alternative for standardized historical data and contract metadata
+Barchart OnDemand,commercial market-data vendor,Futures and other markets depending on package,Licensed API/subscription; verify minute history depth,roll handling,and redistribution terms,https://www.barchart.com/ondemand/api/getHistory,Alternative API source
+Kaggle public datasets,third-party community files,Varies by uploader,Check provenance license timestamp timezone contract rolls and missing bars; suitable for pipeline smoke tests only until validated,https://www.kaggle.com/datasets,Convenient hosting after rights/provenance checks

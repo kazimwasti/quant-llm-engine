@@ -1,0 +1,19 @@
+field,required,description,example_or_rule
+timestamp,yes,Bar end timestamp in UTC; preserve original timezone if supplied,2026-01-05T15:35:00Z
+symbol,yes,Root/product code,NQ
+contract,yes,Specific listed contract month code; do not discard this when rolling,NQH27
+open,yes,Open price,21000.25
+high,yes,High price,21010.00
+low,yes,Low price,20998.00
+close,yes,Close price,21005.50
+volume,yes,Bar volume; specify units and vendor definition,12345
+exchange,yes,Exchange identifier,CME
+bar_interval,yes,Interval and whether timestamp is bar start/end,5min_end
+session_date,yes,Exchange session date,2026-01-05
+timezone,yes,Source timezone or UTC; DST handling must be explicit,UTC
+roll_flag,preferred,Whether this bar is near/at a roll boundary,true/false
+continuous_symbol,preferred,Vendor continuous symbol and roll method,NQ.v.0 volume-roll
+open_interest,optional,Daily/open interest if vendor provides it,123456
+bid,optional,Best bid or quote data for execution modeling,21005.25
+ask,optional,Best ask or quote data for execution modeling,21005.50
+trade_count,optional,Number of transactions in the bar,321
