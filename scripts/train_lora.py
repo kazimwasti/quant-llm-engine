@@ -234,6 +234,13 @@ def main() -> None:
         training_kwargs["load_best_model_at_end"] = True
         training_kwargs["metric_for_best_model"] = "eval_loss"
         training_kwargs["greater_is_better"] = False
+    # Newer transformers releases removed kwargs like warmup_ratio; drop
+    # anything this version does not accept instead of failing at init.
+    unsupported = [key for key in training_kwargs if key not in signature]
+    for key in unsupported:
+        training_kwargs.pop(key)
+    if unsupported:
+        print(f"Dropped TrainingArguments unsupported by this transformers version: {unsupported}")
     training_args = TrainingArguments(**training_kwargs)
     trainer = Trainer(
         model=model,

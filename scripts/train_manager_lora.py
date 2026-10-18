@@ -248,8 +248,16 @@ def main() -> None:
     )
     import inspect
 
-    eval_key = "eval_strategy" if "eval_strategy" in inspect.signature(TrainingArguments.__init__).parameters else "evaluation_strategy"
+    signature = inspect.signature(TrainingArguments.__init__).parameters
+    eval_key = "eval_strategy" if "eval_strategy" in signature else "evaluation_strategy"
     training_kwargs[eval_key] = "epoch"
+    # Newer transformers releases removed kwargs like warmup_ratio; drop
+    # anything this version does not accept instead of failing at init.
+    unsupported = [key for key in training_kwargs if key not in signature]
+    for key in unsupported:
+        training_kwargs.pop(key)
+    if unsupported:
+        print(f"Dropped TrainingArguments unsupported by this transformers version: {unsupported}")
     training_args = TrainingArguments(**training_kwargs)
     trainer = Trainer(
         model=model,

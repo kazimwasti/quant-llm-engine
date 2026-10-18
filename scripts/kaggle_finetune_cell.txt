@@ -1,0 +1,58 @@
+# ============================================================================
+# Quant LLM Engine — fine-tune BOTH LLMs (no dataset uploads needed)
+# Kaggle setup: Notebook -> Settings -> Accelerator: GPU T4 x2, Internet: ON
+#
+# Arm 1 = decision sub-agent (BUY/SELL/HOLD, Qwen2.5-3B, ~1-2 h)
+# Arm 2 = portfolio manager (PolicyWeights, Qwen2.5-1.5B, ~10 min)
+#
+# The manager training data is REGENERATED in this notebook (~2 min, CPU,
+# deterministic seeds) because the committed data/manager_train.jsonl may be
+# a stale intermediate. Requires the remote repo to include the GARCH
+# overflow fix in core/forecast.py.
+# ============================================================================
+
+TRAIN_DECISION_LLM = True   # False if you only want to (re)train the manager
+
+!git clone --depth 1 https://github.com/kazimwasti/quant-llm-engine.git /kaggle/working/qle
+%cd /kaggle/working/qle
+# Backtest cells skip this install to save time; fine-tuning needs the full stack.
+!pip -q install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Arm 2 first: regenerate the manager dataset (overwrites any stale copy),
+# then train the manager adapter. Fast, so it is banked before the long run.
+# ---------------------------------------------------------------------------
+!python scripts/generate_manager_dataset.py --output data/manager_train.jsonl
+
+import json
+rows = [json.loads(line) for line in open('data/manager_train.jsonl', encoding='utf-8')]
+scored = sum(1 for r in rows if r['meta']['n_scored_grid_points'] > 0)
+assert len(rows) >= 200 and scored >= 50, (
+    f'unexpected dataset shape: {len(rows)} rows, {scored} scored — '
+    'check that the remote repo has the final generate_manager_dataset.py'
+)
+print(f'manager dataset OK: {len(rows)} rows, {scored} scored')
+
+!python scripts/train_manager_lora.py \
+    --data data/manager_train.jsonl \
+    --output-dir models/manager_adapter \
+    --epochs 4
+
+# ---------------------------------------------------------------------------
+# Arm 1: the decision sub-agent. Same committed pipeline the README documents.
+# ---------------------------------------------------------------------------
+if TRAIN_DECISION_LLM:
+    !python scripts/train_lora.py \
+        --data data/jev_train_5m.jsonl \
+        --output-dir models/qwen_adapter \
+        --epochs 3
+
+# ---------------------------------------------------------------------------
+# Package both adapters for download / dataset upload.
+# ---------------------------------------------------------------------------
+!cd models && zip -qr /kaggle/working/adapters.zip qwen_adapter manager_adapter
+print('Finished -> /kaggle/working/adapters.zip')
+print('Next steps:')
+print('  1) Kaggle Datasets -> New Dataset (private) from adapters.zip')
+print('  2) Backtest adapter arm: --adapter-dir /kaggle/input/<dataset>/qwen_adapter')
+print('  3) Manager adapter: subclass LLMPolicySource using build_manager_prompt()')
