@@ -1,0 +1,322 @@
+"""Offline acceptance tests for the Tier 1/2 screen, forecasters, and manager.
+
+Everything here is seeded and synthetic: no network, no model downloads.
+"""
+
+from __future__ import annotations
+
+import math
+import unittest
+
+import numpy as np
+import pandas as pd
+
+from core.forecast import (
+    GarchFit,
+    IsotonicCalibrator,
+    MomentumVolForecaster,
+    PolicyWeights,
+    fit_entropy_calibration,
+    fit_garch11,
+)
+from core.manager import (
+    BanditHarness,
+    LLMPolicySource,
+    ManagedScreen,
+    ScreenerConfig,
+    ScreenContext,
+    HeuristicPolicySource,
+    StaticPolicySource,
+    run_screen,
+)
+from core.screener import (
+    CostModel,
+    correlation_matrix,
+    cusum_alarm,
+    effective_bets,
+    greedy_select,
+    parkinson_variance,
+    regression_trend,
+    rolling_zscore,
+    volume_shock,
+)
+from scripts.run_screen import synthetic_universe
+
+
+def ohlc_from_returns(returns: np.ndarray, start: float = 100.0, wick_scale: float = 0.5) -> pd.DataFrame:
+    close = start * np.exp(np.cumsum(returns))
+    open_ = np.empty_like(close)
+    open_[0] = start
+    open_[1:] = close[:-1]
+    wick = np.abs(np.random.default_rng(3).standard_normal(returns.size)) * wick_scale * np.abs(returns) * close
+    wick[wick == 0] = 1e-4
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": np.maximum(open_, close) + wick,
+            "low": np.minimum(open_, close) - wick,
+            "close": close,
+            "volume": np.full(returns.size, 5e4),
+        }
+    )
+
+
+class Tier1MathTests(unittest.TestCase):
+    def test_parkinson_variance_closed_form(self) -> None:
+        ratio = 1.01
+        n = 6
+        high = pd.Series([100.0 * ratio] * n)
+        low = pd.Series([100.0] * n)
+        var = parkinson_variance(high, low, window=5)
+        expected = math.log(ratio) ** 2 / (4.0 * math.log(2.0))
+        self.assertAlmostEqual(float(var.iloc[-1]), expected, places=12)
+        self.assertTrue(var.iloc[:4].isna().all())
+
+    def test_regression_trend_recovers_slope_and_flags_noise(self) -> None:
+        n = 60
+        trend = pd.Series(100.0 + 0.5 * np.arange(n))
+        slope, tstat = regression_trend(trend, window=50)
+        self.assertAlmostEqual(float(slope.iloc[-1]), 0.5, places=6)
+        self.assertGreater(float(tstat.iloc[-1]), 100.0)
+
+        # Stationary noise around a mean -> in-window slope t-stat is
+        # standard-t and small. (A random walk is NOT valid here: unit-root
+        # windows trend spuriously and legitimately produce huge t-stats.)
+        rng = np.random.default_rng(5)
+        noise = pd.Series(100.0 + rng.standard_normal(n))
+        _, noise_t = regression_trend(noise, window=50)
+        self.assertLess(abs(float(noise_t.iloc[-1])), 5.0)
+
+    def test_cusum_fires_on_standardized_variance_shift(self) -> None:
+        rng = np.random.default_rng(17)
+        calm = rng.standard_normal(200) * 1e-3
+        shock = rng.standard_normal(20) * 8e-3
+        returns = pd.Series(np.concatenate([calm, shock]))
+        alarms = cusum_alarm(returns, k=1.5, h=6.0, vol_window=100)
+        self.assertFalse(bool(alarms.iloc[:200].any()))
+        self.assertTrue(bool(alarms.iloc[200:].any()))
+
+    def test_volume_shock_detects_spike(self) -> None:
+        rng = np.random.default_rng(2)
+        volume = pd.Series(1000.0 + rng.standard_normal(60) * 20.0)
+        volume.iloc[-1] = 3000.0
+        shock = volume_shock(volume, window=30, k=3.0)
+        self.assertFalse(bool(shock.iloc[:-1].any()))
+        self.assertTrue(bool(shock.iloc[-1]))
+
+    def test_rolling_zscore_flags_outlier(self) -> None:
+        rng = np.random.default_rng(9)
+        series = pd.Series(100.0 + rng.standard_normal(200) * 0.1)
+        series.iloc[-1] = 103.0  # 30-sigma outlier
+        z = rolling_zscore(series, window=50)
+        # In-window z is bounded by (n-1)/sqrt(n) ~ 7 for n=50.
+        self.assertGreater(float(z.iloc[-1]), 5.0)
+        self.assertLessEqual(abs(float(z.dropna().max())), 7.0 + 1e-9)
+
+    def test_round_trip_cost_combines_fixed_and_impact(self) -> None:
+        model = CostModel(
+            spread_bps=2.0, fee_bps_per_side=1.0, impact_coeff=1.0, order_volume_fraction=0.01
+        )
+        # (2 + 2)/1e4 + 1.0 * 0.001 * sqrt(0.01)
+        self.assertAlmostEqual(model.round_trip_cost(0.001), 0.0005, places=12)
+
+
+class PortfolioStructureTests(unittest.TestCase):
+    def test_effective_bets_identity_and_full_correlation(self) -> None:
+        names = ["a", "b", "c"]
+        identity = pd.DataFrame(np.eye(3), index=names, columns=names)
+        ones = pd.DataFrame(np.ones((3, 3)), index=names, columns=names)
+        vols = {n: 0.01 for n in names}
+        weights = {n: 1.0 for n in names}
+        self.assertAlmostEqual(effective_bets(weights, vols, identity), 3.0, places=9)
+        self.assertAlmostEqual(effective_bets(weights, vols, ones), 1.0, places=9)
+
+    def test_greedy_select_penalizes_correlated_duplicates(self) -> None:
+        names = ["A", "B", "C"]
+        corr = pd.DataFrame(
+            [[1.0, 0.95, 0.10], [0.95, 1.0, 0.10], [0.10, 0.10, 1.0]],
+            index=names,
+            columns=names,
+        )
+        scores = {"A": 2.0, "B": 1.9, "C": 1.2}
+
+        result = greedy_select(scores, corr, top_k=2, penalty_lambda=0.5, max_pairwise_abs_corr=0.99)
+        self.assertEqual(result.selected, ["A", "C"])
+
+        hard = greedy_select(scores, corr, top_k=2, penalty_lambda=0.0, max_pairwise_abs_corr=0.9)
+        self.assertEqual(hard.selected, ["A", "C"])
+        self.assertEqual(hard.blocked, ["B"])
+
+    def test_correlation_matrix_fills_missing_overlap_with_zero(self) -> None:
+        long_series = pd.Series(np.linspace(100, 110, 300))
+        short_series = pd.Series(np.linspace(50, 55, 10))
+        corr = correlation_matrix({"x": long_series, "y": short_series}, window=250)
+        self.assertEqual(float(corr.at["x", "y"]), 0.0)
+        self.assertEqual(float(corr.at["x", "x"]), 1.0)
+
+
+class ForecastTests(unittest.TestCase):
+    def test_garch_recovers_persistence_and_long_run(self) -> None:
+        rng = np.random.default_rng(11)
+        omega, alpha, beta = 5e-8, 0.10, 0.85
+        var = omega / (1.0 - alpha - beta)
+        returns: list[float] = []
+        for _ in range(3000):
+            eps = math.sqrt(var) * float(rng.standard_normal())
+            returns.append(eps)
+            var = omega + alpha * eps**2 + beta * var
+
+        fit = fit_garch11(returns)
+        self.assertLess(abs(fit.persistence - (alpha + beta)), 0.06)
+        self.assertGreater(fit.long_run_variance, 0.4e-6)
+        self.assertLess(fit.long_run_variance, 2.5e-6)
+        self.assertLess(fit.persistence, 1.0)
+
+        path = fit.variance_path(24)
+        start_gap = abs(path[0] - fit.long_run_variance)
+        end_gap = abs(path[-1] - fit.long_run_variance)
+        self.assertLessEqual(end_gap, start_gap)
+
+    def test_garch_rejects_degenerate_input(self) -> None:
+        with self.assertRaises(ValueError):
+            fit_garch11([0.001] * 10)
+        with self.assertRaises(ValueError):
+            fit_garch11([0.0] * 100)
+
+    def test_variance_path_converges_monotonically(self) -> None:
+        fit = GarchFit(
+            omega=5e-8, alpha=0.1, beta=0.85,
+            long_run_variance=1e-6, last_conditional_variance=4e-6,
+            n_obs=100, log_likelihood=0.0,
+        )
+        path = fit.variance_path(50)
+        gaps = [v - fit.long_run_variance for v in path]
+        self.assertTrue(all(g >= gaps[-1] - 1e-18 for g in gaps))  # non-increasing gap
+        self.assertGreater(path[0], path[-1])
+        self.assertGreater(path[-1], fit.long_run_variance * 0.99)
+
+    def test_isotonic_pools_adjacent_violators(self) -> None:
+        cal = IsotonicCalibrator().fit([1.0, 2.0, 3.0], [3.0, 1.0, 2.0])
+        for x in (0.0, 1.5, 2.5, 4.0):
+            self.assertAlmostEqual(cal(x), 2.0)
+
+    def test_isotonic_recovers_monotone_signal(self) -> None:
+        rng = np.random.default_rng(23)
+        x = np.arange(50, dtype=float)
+        y = 0.1 * x + rng.standard_normal(50) * 0.5
+        cal = fit_entropy_calibration(x, y)
+        preds = cal.predict(x)
+        self.assertTrue(all(a <= b + 1e-12 for a, b in zip(preds, preds[1:])))
+        self.assertLess(preds[0], preds[-1])
+        self.assertGreater(abs(preds[-1] - 4.9), -1.0)  # sanity: finite
+        self.assertAlmostEqual(preds[0], preds[0])  # no NaN
+
+    def test_momentum_forecaster_direction_and_scale(self) -> None:
+        rng = np.random.default_rng(31)
+        drift = 8e-4
+        vol = 6e-4
+        returns = drift + vol * rng.standard_normal(400)
+        df = ohlc_from_returns(returns)
+        forecaster = MomentumVolForecaster()
+        forecast = forecaster.forecast("TREND", df, 12, PolicyWeights.equal())
+        self.assertGreater(forecast.expected_return, 0.0)
+        self.assertGreater(forecast.sigma, 0.0)
+        self.assertTrue(math.isfinite(forecast.sigma))
+        self.assertIn(forecast.method, ("garch11", "realized_vol_fallback"))
+
+        rng = np.random.default_rng(32)
+        flat = ohlc_from_returns(0.0 + 6e-4 * rng.standard_normal(400))
+        flat_forecast = forecaster.forecast("FLAT", flat, 12, PolicyWeights.equal())
+        self.assertLess(abs(flat_forecast.expected_return), abs(forecast.expected_return))
+
+
+class ManagerPipelineTests(unittest.TestCase):
+    def _universe(self) -> dict[str, pd.DataFrame]:
+        universe = dict(synthetic_universe(12, n_bars=700, seed=7))
+        rng = np.random.default_rng(41)
+        # Strong drift with vol high enough that the proportional edge clears
+        # the fixed cost component (spread + fees); a weaker drift is a real
+        # edge but too thin for the cost gate, and the screen rightly drops it.
+        trend = ohlc_from_returns(1.2e-3 + 1.2e-3 * rng.standard_normal(700))
+        trend["volume"] = 5e4
+        universe["SYN_TREND"] = trend
+        return universe
+
+    def test_run_screen_gates_and_shortlist(self) -> None:
+        config = ScreenerConfig(edge_cost_multiple=1.5)
+        result = run_screen(self._universe(), config=config)
+
+        failures_illiq = result.reports["SYN_ILLIQ"].gate_failures
+        self.assertIn("dollar_volume", failures_illiq)
+        self.assertIn("atr_floor", result.reports["SYN_FLAT"].gate_failures)
+        self.assertIn("cusum_freeze", result.reports["SYN_REGIMEBREAK"].gate_failures)
+
+        self.assertIn("SYN_TREND", result.shortlist)
+        self.assertTrue(result.shortlist)
+        for symbol in result.shortlist:
+            report = result.reports[symbol]
+            self.assertIsNotNone(report.z_score)
+            self.assertGreater(report.z_score, 0.0)
+            self.assertGreaterEqual(
+                report.expected_return, config.edge_cost_multiple * report.round_trip_cost
+            )
+        self.assertGreaterEqual(result.effective_bets, 1.0)
+        self.assertLessEqual(result.effective_bets, len(result.shortlist) + 1e-9)
+
+    def test_policy_weights_change_the_hunt(self) -> None:
+        universe = self._universe()
+        config = ScreenerConfig(edge_cost_multiple=1.0, top_k=8)
+        trend_heavy = run_screen(universe, config=config, policy=PolicyWeights(trend=2.0, stretch=0.1))
+        regime_heavy = run_screen(universe, config=config, policy=PolicyWeights(trend=0.1, vol_regime=2.0))
+        z_trend = trend_heavy.reports["SYN_TREND"].z_score
+        z_regime = regime_heavy.reports["SYN_TREND"].z_score
+        self.assertIsNotNone(z_trend)
+        self.assertIsNotNone(z_regime)
+        self.assertGreater(z_trend, z_regime)
+
+    def test_bandit_learns_to_prefer_the_better_source(self) -> None:
+        bandit = BanditHarness(epsilon=0.05, decay=1.0, min_epsilon=0.05, seed=0)
+        counts = {"good": 0, "bad": 0}
+        for _ in range(300):
+            chosen = bandit.select(["good", "bad"])
+            bandit.record(chosen, 1.0 if chosen == "good" else -1.0)
+            counts[chosen] += 1
+        self.assertGreater(counts["good"], counts["bad"] * 2)
+        stats = bandit.stats()
+        self.assertGreater(stats["good"]["mean"], 0.9)
+        self.assertLess(stats["bad"]["mean"], -0.9)
+
+    def test_heuristic_policy_tilts_on_regime_break(self) -> None:
+        source = HeuristicPolicySource()
+        calm = source.propose(ScreenContext(n_universe=10, pct_cusum_alarms=0.1, avg_vol_percentile=0.5))
+        broke = source.propose(ScreenContext(n_universe=10, pct_cusum_alarms=0.8, avg_vol_percentile=0.9))
+        self.assertGreater(broke.vol_regime, calm.vol_regime)
+        self.assertLess(broke.trend, calm.trend)
+
+    def test_llm_policy_source_is_a_wired_stub(self) -> None:
+        source = LLMPolicySource()
+        with self.assertRaises(NotImplementedError):
+            source.propose(ScreenContext(n_universe=1, pct_cusum_alarms=0.0, avg_vol_percentile=0.5))
+
+    def test_managed_screen_loop_and_feedback(self) -> None:
+        managed = ManagedScreen(
+            sources={
+                "static": StaticPolicySource(weights=PolicyWeights(trend=2.0)),
+                "heuristic": HeuristicPolicySource(),
+            },
+            config=ScreenerConfig(edge_cost_multiple=1.0),
+        )
+        result, chosen = managed.screen(self._universe())
+        self.assertIn(chosen, managed.sources)
+        self.assertTrue(result.shortlist)
+        managed.feedback(0.5)
+        self.assertIn(managed._last_source, managed.bandit.stats())
+
+    def test_feedback_before_screen_raises(self) -> None:
+        managed = ManagedScreen(sources={"a": StaticPolicySource()})
+        with self.assertRaises(RuntimeError):
+            managed.feedback(1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -42,8 +42,46 @@ quant-llm-engine/
 ├── scripts/                    # Utility, data, and training execution scripts
 │   ├── dataset_generator.py   # Synthesizes JSONL instruction datasets
 │   ├── download_data.py        # Historical data fetching pipelines
+│   ├── run_screen.py           # Tier 1/2 screen demo CLI (see Screening pipeline)
 │   └── train_lora.py           # PEFT / QLoRA 4-bit fine-tuning script
 └── tests/                      # Offline operational-safety acceptance tests
+```
+
+## Screening pipeline (`core/screener.py`, `core/forecast.py`, `core/manager.py`)
+
+A deterministic three-tier funnel that decides *which* symbols deserve LLM
+inference, so sub-agent models never see a name that cheap math has not
+already cleared:
+
+1. **Tier 1 (closed-form math)** — liquidity/dollar-volume gates, Parkinson
+   and Garman-Klass volatility, regression-t-statistic trend strength,
+   rolling z-score stretch, volume shocks, and a scale-invariant CUSUM
+   regime-break alarm (a firing alarm freezes a symbol until its forecasts
+   are re-estimated).
+2. **Tier 2 (numeric models)** — GARCH(1,1) volatility forecasting (QMLE via
+   a built-in Nelder-Mead, no scipy dependency), a cheap deterministic
+   E[X] forecaster over Tier-1 features, and isotonic calibration for
+   mapping decision entropy onto realized error before anything trusts it
+   as a variance input.
+3. **Cost gate + Z-rank selection** — expected edge must clear the
+   round-trip cost (spread + fees + square-root impact) by a configurable
+   multiple; survivors are ranked by Z = (E − cost)/σ and selected greedily
+   with a correlation penalty and pairwise-correlation cap, then scored by
+   effective independent bets (N_eff) so ten correlated picks are not
+   mistaken for ten bets.
+
+The LLM-shaped slot is `PolicySource.propose` in `core/manager.py`: the
+manager model receives a numeric context summary and returns four
+`PolicyWeights` — numbers, never orders. Every policy source is scored by an
+epsilon-greedy `BanditHarness` against realized rewards, so an LLM manager
+must beat the deterministic baselines on outcomes to keep influence. Wire a
+fine-tuned adapter in by subclassing `LLMPolicySource`.
+
+Run the offline screen demo (no network, seeded synthetic universe):
+
+```powershell
+python scripts/run_screen.py --synthetic-only
+python -m unittest tests.test_screening -v
 ```
 
 ## Operational test readiness
