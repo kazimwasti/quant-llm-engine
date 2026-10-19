@@ -22,11 +22,13 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Mapping, Optional, Protocol
 
 import pandas as pd
 
 from .forecast import Forecaster, MomentumVolForecaster, PolicyWeights
+from .risk import PropFirmRiskManager
 from .screener import (
     CostModel,
     GreedySelection,
@@ -103,6 +105,7 @@ class ScreenResult:
     correlation: pd.DataFrame
     policy: PolicyWeights
     context: dict[str, float]
+    topology: Optional["TradeTopology"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +132,14 @@ def build_context(universe: Mapping[str, pd.DataFrame], config: ScreenerConfig) 
         returns = df["close"].astype(float).pct_change().tail(config.trend_window)
         if bool(cusum_alarm(returns, config.cusum_k, config.cusum_h).iloc[-1]):
             alarms += 1
-        feats = latest_features(df)
+        feats = latest_features(
+            df,
+            trend_window=config.trend_window,
+            zscore_window=config.zscore_window,
+            shock_window=config.shock_window,
+            shock_k=config.shock_k,
+            vol_window=config.vol_window,
+        )
         if feats["vol_percentile"] == feats["vol_percentile"]:
             vol_pcts.append(feats["vol_percentile"])
     n = max(len(universe), 1)
@@ -163,7 +173,14 @@ def run_screen(
         if report.gate_failures:
             continue
 
-        feats = latest_features(df)
+        feats = latest_features(
+            df,
+            trend_window=config.trend_window,
+            zscore_window=config.zscore_window,
+            shock_window=config.shock_window,
+            shock_k=config.shock_k,
+            vol_window=config.vol_window,
+        )
         report.features = feats
         if feats["atr_pct"] != feats["atr_pct"] or feats["atr_pct"] < config.min_atr_pct:
             report.gate_failures.append("atr_floor")
@@ -238,6 +255,251 @@ class ScreenContext:
     n_universe: int
     pct_cusum_alarms: float
     avg_vol_percentile: float
+    target_enabled: bool = False
+    target_progress: float = 0.0
+    session_progress: float = 0.0
+    remaining_loss_budget_fraction: float = 1.0
+
+
+@dataclass(frozen=True)
+class PortfolioContext:
+    """Numeric account state a manager may use without receiving order authority.
+
+    ``target_progress`` is the fraction of the configured daily target already
+    earned.  It is deliberately not a "catch-up" signal: being behind late in
+    a session must never make the mandate more aggressive.
+    """
+
+    target_enabled: bool = False
+    target_progress: float = 0.0
+    session_progress: float = 0.0
+    remaining_loss_budget_fraction: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "target_progress",
+            "session_progress",
+            "remaining_loss_budget_fraction",
+        ):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+
+    @classmethod
+    def from_risk(cls, risk: PropFirmRiskManager) -> "PortfolioContext":
+        target = risk.daily_profit_target
+        progress = 0.0 if target is None else min(1.0, max(0.0, risk.daily_pnl / target))
+        budget = risk.daily_loss_budget
+        remaining = 0.0 if budget <= 0 else min(1.0, risk.remaining_daily_budget / budget)
+        return cls(
+            target_enabled=target is not None,
+            target_progress=progress,
+            session_progress=risk.session_progress,
+            remaining_loss_budget_fraction=remaining,
+        )
+
+
+@dataclass(frozen=True)
+class TradeTopology:
+    """Bounded trading mandate attached to every manager-approved symbol.
+
+    The limits are intentionally broad enough to leave entry timing and thesis
+    formation to a specialist sub-agent.  They are portfolio instructions, not
+    orders.  The risk manager remains the final hard limit.
+
+    ``max_decision_entropy`` is a *maximum* normalized entropy over the three
+    BUY/SELL/HOLD probabilities.  Lower entropy means a more decisive model;
+    requiring a minimum entropy would have the opposite of the intended safety
+    effect.
+    """
+
+    risk_multiplier: float = 1.0
+    max_holding_bars: int = 12
+    min_confidence: float = 0.65
+    max_decision_entropy: float = 0.85
+    envelope_distance_multiplier: float = 1.0
+    style_preference: str = "confirmed_structure"
+    confirmation_band: float = 0.07
+    max_open_positions: int = 5
+    max_gross_risk_fraction: float = 0.015
+    max_net_directional_risk_fraction: float = 0.010
+    max_sector_positions: int = 2
+    max_correlated_positions: int = 2
+    correlation_capacity_threshold: float = 0.80
+    max_data_age_seconds: float = 90.0
+    max_spread_bps: float = 15.0
+    max_impact_bps: float = 12.0
+    max_order_volume_fraction: float = 0.01
+    rationale: str = "normal market conditions"
+
+    def __post_init__(self) -> None:
+        if not 0.25 <= self.risk_multiplier <= 1.20:
+            raise ValueError("risk_multiplier must be between 0.25 and 1.20")
+        if not 1 <= self.max_holding_bars <= 48:
+            raise ValueError("max_holding_bars must be between 1 and 48")
+        if not 0.50 <= self.min_confidence <= 0.95:
+            raise ValueError("min_confidence must be between 0.50 and 0.95")
+        if not 0.25 <= self.max_decision_entropy <= 1.0:
+            raise ValueError("max_decision_entropy must be between 0.25 and 1")
+        if not 0.60 <= self.envelope_distance_multiplier <= 1.40:
+            raise ValueError("envelope_distance_multiplier must be between 0.60 and 1.40")
+        if self.style_preference not in {"confirmed_structure", "defensive_continuation"}:
+            raise ValueError("style_preference is not recognized")
+        if not 0.0 <= self.confirmation_band <= 0.20:
+            raise ValueError("confirmation_band must be between 0 and 0.20")
+        if self.max_open_positions < 1 or self.max_sector_positions < 1:
+            raise ValueError("position capacity limits must be positive")
+        if self.max_correlated_positions < 0:
+            raise ValueError("max_correlated_positions must be non-negative")
+        if not 0 < self.max_gross_risk_fraction <= 0.05:
+            raise ValueError("max_gross_risk_fraction must be in (0, 0.05]")
+        if not 0 < self.max_net_directional_risk_fraction <= self.max_gross_risk_fraction:
+            raise ValueError("net directional risk must be positive and no larger than gross risk")
+        if not 0 < self.correlation_capacity_threshold <= 1:
+            raise ValueError("correlation_capacity_threshold must be in (0, 1]")
+        if self.max_data_age_seconds <= 0 or self.max_spread_bps < 0 or self.max_impact_bps < 0:
+            raise ValueError("execution-quality thresholds must be non-negative")
+        if not 0 < self.max_order_volume_fraction <= 0.10:
+            raise ValueError("max_order_volume_fraction must be in (0, 0.10]")
+
+
+def derive_trade_topology(context: ScreenContext) -> TradeTopology:
+    """Convert cheap market/account measurements into a conservative mandate.
+
+    A modest 1.15x risk budget is allowed only early in a calm session, with
+    most of the loss budget intact, and only when a configured target is still
+    far away.  The policy never "chases" a target late in the session.
+    """
+
+    turbulent = context.pct_cusum_alarms >= 0.30 or context.avg_vol_percentile >= 0.80
+    near_target = context.target_enabled and context.target_progress >= 0.75
+    calm_early_far_from_target = (
+        context.target_enabled
+        and context.target_progress < 0.25
+        and context.session_progress <= 0.50
+        and context.remaining_loss_budget_fraction >= 0.70
+        and not turbulent
+    )
+    if turbulent:
+        return TradeTopology(
+            risk_multiplier=0.75,
+            max_holding_bars=6,
+            min_confidence=0.70,
+            max_decision_entropy=0.72,
+            envelope_distance_multiplier=0.70,
+            style_preference="defensive_continuation",
+            rationale="turbulent regime: shorten exposure and require clearer decisions",
+        )
+    if near_target:
+        return TradeTopology(
+            risk_multiplier=0.50,
+            max_holding_bars=8,
+            min_confidence=0.72,
+            max_decision_entropy=0.75,
+            envelope_distance_multiplier=0.75,
+            style_preference="defensive_continuation",
+            rationale="near daily target: protect gains rather than extend risk",
+        )
+    if calm_early_far_from_target:
+        return TradeTopology(
+            risk_multiplier=1.15,
+            max_holding_bars=12,
+            min_confidence=0.65,
+            max_decision_entropy=0.85,
+            envelope_distance_multiplier=1.15,
+            rationale="calm early session with ample budget and distant target",
+        )
+    return TradeTopology()
+
+
+@dataclass(frozen=True)
+class PortfolioAllocation:
+    """A manager reservation for one open or pending directional position."""
+
+    order_id: str
+    symbol: str
+    side: str
+    risk_dollars: float
+    sector: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.side not in {"long", "short"}:
+            raise ValueError("side must be long or short")
+        if not self.order_id or not self.symbol or self.risk_dollars <= 0:
+            raise ValueError("order_id, symbol, and positive risk_dollars are required")
+
+
+class PortfolioCapacityGuard:
+    """In-memory, constant-small-work portfolio gate for manager allocations.
+
+    It only examines existing allocations (normally a handful) and correlations
+    already computed by the screen; it never launches model inference.  The
+    broker-facing layer must release a reservation on a definitive rejection or
+    close.
+    """
+
+    def __init__(self, topology: TradeTopology) -> None:
+        self.topology = topology
+        self._allocations: dict[str, PortfolioAllocation] = {}
+        self._lock = RLock()
+
+    def check(
+        self,
+        allocation: PortfolioAllocation,
+        account_equity: float,
+        correlations: Optional[Mapping[str, float]] = None,
+    ) -> tuple[bool, str]:
+        if account_equity <= 0:
+            return False, "account_equity must be positive"
+        with self._lock:
+            if allocation.order_id in self._allocations:
+                return False, "duplicate portfolio allocation"
+            open_allocations = list(self._allocations.values())
+            if len(open_allocations) >= self.topology.max_open_positions:
+                return False, "manager maximum open-position capacity reached"
+            gross = sum(item.risk_dollars for item in open_allocations) + allocation.risk_dollars
+            if gross > account_equity * self.topology.max_gross_risk_fraction + 1e-9:
+                return False, "manager gross-risk capacity reached"
+            signed = sum(
+                item.risk_dollars if item.side == "long" else -item.risk_dollars
+                for item in open_allocations
+            )
+            signed += allocation.risk_dollars if allocation.side == "long" else -allocation.risk_dollars
+            if abs(signed) > account_equity * self.topology.max_net_directional_risk_fraction + 1e-9:
+                return False, "manager net directional-risk capacity reached"
+            if allocation.sector is not None:
+                sector_count = sum(item.sector == allocation.sector for item in open_allocations)
+                if sector_count >= self.topology.max_sector_positions:
+                    return False, "manager sector capacity reached"
+            correlations = correlations or {}
+            correlated_count = sum(
+                abs(float(correlations.get(item.symbol, 0.0)))
+                >= self.topology.correlation_capacity_threshold
+                for item in open_allocations
+            )
+            if correlated_count > self.topology.max_correlated_positions:
+                return False, "manager correlated-position capacity reached"
+            return True, ""
+
+    def reserve(
+        self,
+        allocation: PortfolioAllocation,
+        account_equity: float,
+        correlations: Optional[Mapping[str, float]] = None,
+    ) -> tuple[bool, str]:
+        with self._lock:
+            allowed, reason = self.check(allocation, account_equity, correlations)
+            if allowed:
+                self._allocations[allocation.order_id] = allocation
+            return allowed, reason
+
+    def release(self, order_id: str) -> None:
+        with self._lock:
+            self._allocations.pop(order_id, None)
+
+    def allocations(self) -> tuple[PortfolioAllocation, ...]:
+        with self._lock:
+            return tuple(self._allocations.values())
 
 
 class PolicySource(Protocol):
@@ -438,12 +700,35 @@ class ManagedScreen:
     forecaster: Optional[Forecaster] = None
     _last_source: Optional[str] = field(default=None, init=False)
 
-    def screen(self, universe: Mapping[str, pd.DataFrame]) -> tuple[ScreenResult, str]:
+    def screen(
+        self,
+        universe: Mapping[str, pd.DataFrame],
+        portfolio: Optional[PortfolioContext] = None,
+    ) -> tuple[ScreenResult, str]:
+        """Screen a universe and attach one bounded mandate to its shortlist.
+
+        Callers with a live ``PropFirmRiskManager`` should pass
+        ``PortfolioContext.from_risk(risk)``.  Omitting it preserves a neutral
+        mandate for research-only screens.
+        """
         raw_context = build_context(universe, self.config or ScreenerConfig())
+        portfolio = portfolio or PortfolioContext()
+        raw_context.update(
+            {
+                "target_enabled": float(portfolio.target_enabled),
+                "target_progress": portfolio.target_progress,
+                "session_progress": portfolio.session_progress,
+                "remaining_loss_budget_fraction": portfolio.remaining_loss_budget_fraction,
+            }
+        )
         context = ScreenContext(
             n_universe=int(raw_context["n_universe"]),
             pct_cusum_alarms=raw_context["pct_cusum_alarms"],
             avg_vol_percentile=raw_context["avg_vol_percentile"],
+            target_enabled=portfolio.target_enabled,
+            target_progress=portfolio.target_progress,
+            session_progress=portfolio.session_progress,
+            remaining_loss_budget_fraction=portfolio.remaining_loss_budget_fraction,
         )
         names = list(self.sources)
         chosen = self.bandit.select(names)
@@ -453,6 +738,7 @@ class ManagedScreen:
             universe, config=self.config, forecaster=self.forecaster, policy=policy,
             context=raw_context,
         )
+        result.topology = derive_trade_topology(context)
         return result, chosen
 
     def feedback(self, reward: float) -> None:

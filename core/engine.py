@@ -17,11 +17,12 @@ of the pipeline stays testable without a trained transformer.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 import pandas as pd
 
+from .manager import TradeTopology
 from .risk import PositionSize, PropFirmRiskManager
 from .strategy import (
     DEFAULT_ATR_STOP_MULTIPLIER,
@@ -137,6 +138,53 @@ class ExecutionPayload:
     prompt: str
     source: str
     size: Optional[PositionSize] = None
+    max_holding_bars: Optional[int] = None
+    thesis: Optional["TradeThesis"] = None
+
+
+@dataclass(frozen=True)
+class TradePreflight:
+    """Cheap quote/data checks supplied by the market-data and execution adapter."""
+
+    data_age_seconds: float
+    spread_bps: float
+    estimated_impact_bps: float
+    order_volume_fraction: float
+    data_complete: bool = True
+    trading_halted: bool = False
+    corporate_action_pending: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("data_age_seconds", "spread_bps", "estimated_impact_bps", "order_volume_fraction"):
+            if float(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+    def failure_reason(self, topology: TradeTopology) -> str:
+        if not self.data_complete:
+            return "market-data preflight is incomplete"
+        if self.trading_halted:
+            return "market-data preflight reports a trading halt"
+        if self.corporate_action_pending:
+            return "market-data preflight reports a pending corporate action"
+        if self.data_age_seconds > topology.max_data_age_seconds:
+            return "market-data preflight is stale"
+        if self.spread_bps > topology.max_spread_bps:
+            return "estimated spread exceeds manager limit"
+        if self.estimated_impact_bps > topology.max_impact_bps:
+            return "estimated impact exceeds manager limit"
+        if self.order_volume_fraction > topology.max_order_volume_fraction:
+            return "estimated order participation exceeds manager limit"
+        return ""
+
+
+@dataclass(frozen=True)
+class TradeThesis:
+    """Audit record assembled from already-computed decision state; never generated text."""
+
+    style: str
+    entry_basis: str
+    invalidation_price: float
+    review_after_bars: int
 
 
 def ingest_market_state(df: pd.DataFrame) -> MarketState:
@@ -165,8 +213,20 @@ def ingest_market_state(df: pd.DataFrame) -> MarketState:
     )
 
 
-def format_decision_prompt(state: MarketState) -> str:
+def format_decision_prompt(state: MarketState, topology: Optional[TradeTopology] = None) -> str:
     """Constrained strategy prompt. Next token is expected to be BUY|SELL|HOLD."""
+    mandate = ""
+    if topology is not None:
+        mandate = (
+            "\nManager mandate (portfolio limits, not a directional order):\n"
+            f"- Risk budget multiplier: {topology.risk_multiplier:.2f}x base risk.\n"
+            f"- Maximum holding time: {topology.max_holding_bars} bars.\n"
+            f"- Minimum directional confidence: {topology.min_confidence:.2f}.\n"
+            f"- Maximum normalized decision entropy: {topology.max_decision_entropy:.2f}.\n"
+            f"- Re-evaluation envelope multiplier: {topology.envelope_distance_multiplier:.2f}x.\n"
+            f"- Preferred style: {topology.style_preference}.\n"
+            f"- Context: {topology.rationale}\n"
+        )
     return (
         "Strategy objective and hard decision rules:\n"
         "- Only consider setups with a 1.0x ATR stop and a minimum 2.2x ATR profit target (at least 1:2.2 reward-to-risk).\n"
@@ -175,7 +235,8 @@ def format_decision_prompt(state: MarketState) -> str:
         "- Session and volatility regimes must both be active.\n"
         "- If any requirement is missing, the regime is choppy/low-conviction, or evidence is ambiguous, choose HOLD.\n"
         "- These rules are constraints, not a promise of any win rate or return.\n"
-        "\n"
+        + mandate
+        + "\n"
         "State:\n"
         f"close={state.close:.6f}\n"
         f"ema_200={state.ema_200:.6f}\n"
@@ -218,6 +279,21 @@ def softmax(logits: Mapping[str, float]) -> dict[str, float]:
         uniform = 1.0 / len(logits)
         return {key: uniform for key in logits}
     return {key: value / total for key, value in exps.items()}
+
+
+def normalized_decision_entropy(probabilities: Mapping[str, float]) -> float:
+    """Shannon entropy of the closed action distribution, scaled to [0, 1]."""
+    if len(probabilities) < 2:
+        return 0.0
+    total = sum(max(0.0, float(value)) for value in probabilities.values())
+    if total <= 0:
+        return 1.0
+    entropy = 0.0
+    for value in probabilities.values():
+        probability = max(0.0, float(value)) / total
+        if probability > 0:
+            entropy -= probability * math.log(probability)
+    return entropy / math.log(len(probabilities))
 
 
 def feature_action_logits(state: MarketState) -> dict[str, float]:
@@ -334,11 +410,12 @@ def extract_decision(
     state: MarketState,
     backend: Optional[TokenLogitBackend] = None,
     min_confidence: float = 0.65,
+    topology: Optional[TradeTopology] = None,
 ) -> Decision:
     """Softmax over BUY/SELL/HOLD scores only; never parse generated text."""
     if not 0.0 <= min_confidence <= 1.0:
         raise ValueError("min_confidence must be between 0 and 1")
-    prompt = format_decision_prompt(state)
+    prompt = format_decision_prompt(state, topology)
     source = "feature_fallback"
     if backend is None:
         backend = FeatureLogitBackend(state)
@@ -356,6 +433,13 @@ def extract_decision(
     confidence = probabilities[action]
     if action in ("BUY", "SELL") and probabilities[action] < min_confidence:
         action = "HOLD"
+    if (
+        action in ("BUY", "SELL")
+        and topology is not None
+        and normalized_decision_entropy(probabilities) > topology.max_decision_entropy
+    ):
+        action = "HOLD"
+        source = f"{source}+entropy_blocked"
     if not state.session_allowed or not state.volatility_active:
         action = "HOLD"
         source = f"{source}+regime_blocked"
@@ -380,6 +464,53 @@ def extract_decision(
         prompt=prompt,
         source=source,
         market=state,
+    )
+
+
+def confirm_marginal_decision(
+    primary: Decision,
+    *,
+    backend: Optional[TokenLogitBackend],
+    min_confidence: float,
+    topology: Optional[TradeTopology],
+) -> Decision:
+    """Ask an optional second scorer only for marginal directional decisions.
+
+    This preserves the Jev one-shot path for clear decisions.  When configured,
+    the second scorer runs only inside the manager's narrow confirmation band;
+    disagreement fails closed to HOLD.
+    """
+    if backend is None or primary.action not in {"BUY", "SELL"} or topology is None:
+        return primary
+    if primary.confidence > min_confidence + topology.confirmation_band:
+        return primary
+    secondary = extract_decision(
+        primary.market,
+        backend=backend,
+        min_confidence=min_confidence,
+        topology=topology,
+    )
+    if secondary.action == primary.action:
+        return replace(primary, source=f"{primary.source}+secondary_confirmed")
+    return replace(primary, action="HOLD", source=f"{primary.source}+model_disagreement_blocked")
+
+
+def build_trade_thesis(
+    decision: Decision, stop_price: float, topology: Optional[TradeTopology]
+) -> TradeThesis:
+    """Create a concise, deterministic entry audit record without token generation."""
+    style = topology.style_preference if topology is not None else "confirmed_structure"
+    review_after = topology.max_holding_bars if topology is not None else 12
+    basis = (
+        "confirmed bullish structure, signal, and higher-timeframe alignment"
+        if decision.action == "BUY"
+        else "confirmed bearish structure, signal, and higher-timeframe alignment"
+    )
+    return TradeThesis(
+        style=style,
+        entry_basis=basis,
+        invalidation_price=stop_price,
+        review_after_bars=review_after,
     )
 
 
@@ -412,7 +543,16 @@ class DiscreteDeviationTrigger:
         self.anchor_drift = drift
         self.checkpoint = 0
 
-    def observe(self, state: MarketState) -> bool:
+    def observe(self, state: MarketState, manager_multiplier: float = 1.0) -> bool:
+        """Return whether the predicted path needs a new decision.
+
+        ``manager_multiplier`` is the manager's third, cheap term in the
+        envelope equation.  It multiplies the agent's existing volatility and
+        confidence-derived envelope rather than replacing it: values below one
+        re-evaluate sooner; values above one conserve inference calls.
+        """
+        if not 0.60 <= manager_multiplier <= 1.40:
+            raise ValueError("manager_multiplier must be between 0.60 and 1.40")
         if not state.is_complete():
             return False
         if not math.isfinite(self.anchor_close):
@@ -421,7 +561,12 @@ class DiscreteDeviationTrigger:
         self.checkpoint += 1
         step = min(self.checkpoint, self.horizon)
         expected = self.anchor_close + self.anchor_drift * step
-        width = state.atr_14 * self.envelope_atr_multiplier * math.sqrt(step)
+        width = (
+            state.atr_14
+            * self.envelope_atr_multiplier
+            * math.sqrt(step)
+            * manager_multiplier
+        )
         self.last_deviation_atr = abs(state.close - expected) / max(state.atr_14, 1e-12)
         deviated = abs(state.close - expected) > width
         expired = self.checkpoint >= self.horizon
@@ -456,6 +601,11 @@ def build_execution_payload(
     *,
     point_value: Optional[float] = None,
     cost_per_contract: float = 0.0,
+    manager_risk_multiplier: float = 1.0,
+    max_holding_bars: Optional[int] = None,
+    max_decision_entropy: Optional[float] = None,
+    topology: Optional[TradeTopology] = None,
+    preflight: Optional[TradePreflight] = None,
 ) -> ExecutionPayload:
     """Size BUY/SELL through the prop-firm manager; HOLD never opens risk."""
     breaker = risk.circuit_breaker_active()
@@ -481,6 +631,55 @@ def build_execution_payload(
             reason=reason,
             prompt=decision.prompt,
             source=decision.source,
+            max_holding_bars=max_holding_bars,
+        )
+
+    if topology is not None:
+        if preflight is None:
+            quality_reason = "manager topology requires a market-data preflight"
+        else:
+            quality_reason = preflight.failure_reason(topology)
+        if quality_reason:
+            return ExecutionPayload(
+                approved=False,
+                action="HOLD",
+                model_action=decision.action,
+                quantity=0.0,
+                side=ACTION_TO_SIDE[decision.action],
+                entry=decision.market.close,
+                stop_price=None,
+                stop_distance=0.0,
+                risk_dollars=0.0,
+                probabilities=decision.probabilities,
+                confidence=decision.confidence,
+                circuit_breaker=breaker,
+                reason=quality_reason,
+                prompt=decision.prompt,
+                source=f"{decision.source}+preflight_blocked",
+                max_holding_bars=max_holding_bars,
+            )
+
+    if (
+        max_decision_entropy is not None
+        and normalized_decision_entropy(decision.probabilities) > max_decision_entropy
+    ):
+        return ExecutionPayload(
+            approved=False,
+            action="HOLD",
+            model_action=decision.action,
+            quantity=0.0,
+            side=ACTION_TO_SIDE[decision.action],
+            entry=decision.market.close,
+            stop_price=None,
+            stop_distance=0.0,
+            risk_dollars=0.0,
+            probabilities=decision.probabilities,
+            confidence=decision.confidence,
+            circuit_breaker=breaker,
+            reason="manager entropy limit blocked directional trade",
+            prompt=decision.prompt,
+            source=f"{decision.source}+entropy_blocked",
+            max_holding_bars=max_holding_bars,
         )
 
     if breaker or not allowed:
@@ -500,6 +699,7 @@ def build_execution_payload(
             reason=allow_reason or risk.halt_reason or "daily-loss circuit breaker",
             prompt=decision.prompt,
             source=decision.source,
+            max_holding_bars=max_holding_bars,
         )
 
     stop_price, stop_distance = _stop_for_action(decision.market, decision.action)
@@ -507,6 +707,7 @@ def build_execution_payload(
         stop_distance,
         point_value=point_value,
         cost_per_contract=cost_per_contract,
+        manager_risk_multiplier=manager_risk_multiplier,
     )
     if size.blocked or size.quantity <= 0:
         return ExecutionPayload(
@@ -526,6 +727,7 @@ def build_execution_payload(
             prompt=decision.prompt,
             source=decision.source,
             size=size,
+            max_holding_bars=max_holding_bars,
         )
 
     return ExecutionPayload(
@@ -545,6 +747,8 @@ def build_execution_payload(
         prompt=decision.prompt,
         source=decision.source,
         size=size,
+        max_holding_bars=max_holding_bars,
+        thesis=build_trade_thesis(decision, stop_price, topology),
     )
 
 
@@ -556,9 +760,11 @@ class TradingEngine:
     backend: Optional[TokenLogitBackend] = None
     min_confidence: float = 0.65
     auto_reserve: bool = False
+    topology: Optional[TradeTopology] = None
+    confirmation_backend: Optional[TokenLogitBackend] = None
     deviation_trigger: DiscreteDeviationTrigger = field(default_factory=DiscreteDeviationTrigger)
 
-    def step(self, df: pd.DataFrame) -> ExecutionPayload:
+    def step(self, df: pd.DataFrame, preflight: Optional[TradePreflight] = None) -> ExecutionPayload:
         state = ingest_market_state(df)
         self.risk.session_progress = state.session_progress
         if self.risk.circuit_breaker_active():
@@ -579,7 +785,10 @@ class TradingEngine:
                 prompt="",
                 source="risk_circuit_breaker",
             )
-        if not self.deviation_trigger.observe(state):
+        if not self.deviation_trigger.observe(
+            state,
+            self.topology.envelope_distance_multiplier if self.topology is not None else 1.0,
+        ):
             return ExecutionPayload(
                 approved=False,
                 action="HOLD",
@@ -600,15 +809,38 @@ class TradingEngine:
         backend = self.backend
         if backend is None:
             backend = FeatureLogitBackend(state)
+        required_confidence = max(
+            self.min_confidence,
+            self.risk.required_confidence(state.session_progress),
+            self.topology.min_confidence if self.topology is not None else 0.0,
+        )
         decision = extract_decision(
             state,
             backend=backend,
-            min_confidence=max(
-                self.min_confidence,
-                self.risk.required_confidence(state.session_progress),
-            ),
+            min_confidence=required_confidence,
+            topology=self.topology,
         )
-        payload = build_execution_payload(decision, self.risk)
+        decision = confirm_marginal_decision(
+            decision,
+            backend=self.confirmation_backend,
+            min_confidence=required_confidence,
+            topology=self.topology,
+        )
+        payload = build_execution_payload(
+            decision,
+            self.risk,
+            manager_risk_multiplier=(
+                self.topology.risk_multiplier if self.topology is not None else 1.0
+            ),
+            max_holding_bars=(
+                self.topology.max_holding_bars if self.topology is not None else None
+            ),
+            max_decision_entropy=(
+                self.topology.max_decision_entropy if self.topology is not None else None
+            ),
+            topology=self.topology,
+            preflight=preflight,
+        )
         if self.auto_reserve and payload.approved and payload.size is not None:
             self.risk.reserve_open_risk(payload.size)
         return payload

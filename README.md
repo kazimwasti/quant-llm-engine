@@ -77,6 +77,30 @@ epsilon-greedy `BanditHarness` against realized rewards, so an LLM manager
 must beat the deterministic baselines on outcomes to keep influence. Wire a
 fine-tuned adapter in by subclassing `LLMPolicySource`.
 
+`ManagedScreen` also attaches one bounded `TradeTopology` to every shortlist.
+It expresses the portfolio-level mandate for the specialist decision agents:
+risk multiplier, maximum holding bars, minimum directional confidence,
+maximum normalized BUY/SELL/HOLD entropy, and an envelope-distance multiplier.
+The latter is a third multiplicative term in the existing predicted-path
+trigger: it narrows the envelope in turbulent/protective conditions and widens
+it slightly in calm conditions to avoid unnecessary inference. The topology is derived from cheap
+market and account-state inputs; it allows at most a modest 1.15x risk budget
+only in calm early conditions with ample loss budget, never as late-session
+target chasing.  `TradingEngine` and `Simulator` enforce those fields, while
+`PropFirmRiskManager` retains final circuit-breaker authority.
+
+```python
+portfolio = PortfolioContext.from_risk(risk)
+screen, source = managed_screen.screen(universe, portfolio)
+for symbol in screen.shortlist:
+    specialist = TradingEngine(risk=risk, topology=screen.topology)
+    # Send only universe[symbol] to this specialist.
+```
+
+Here "entropy" means uncertainty in the closed BUY/SELL/HOLD decision
+distribution. A lower value is more decisive, so the manager uses a maximum
+entropy limit rather than a misleading minimum-entropy requirement.
+
 Run the offline screen demo (no network, seeded synthetic universe):
 
 ```powershell

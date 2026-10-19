@@ -23,12 +23,22 @@ from core.manager import (
     BanditHarness,
     LLMPolicySource,
     ManagedScreen,
+    PortfolioContext,
     ScreenerConfig,
     ScreenContext,
     HeuristicPolicySource,
     StaticPolicySource,
+    derive_trade_topology,
     run_screen,
 )
+from core.engine import (
+    Decision,
+    DiscreteDeviationTrigger,
+    MarketState,
+    build_execution_payload,
+    normalized_decision_entropy,
+)
+from core.risk import PropFirmRiskManager
 from core.screener import (
     CostModel,
     correlation_matrix,
@@ -311,6 +321,102 @@ class ManagerPipelineTests(unittest.TestCase):
         self.assertTrue(result.shortlist)
         managed.feedback(0.5)
         self.assertIn(managed._last_source, managed.bandit.stats())
+
+    def test_topology_is_calm_early_only_and_attached_to_screen(self) -> None:
+        early = derive_trade_topology(
+            ScreenContext(
+                n_universe=500,
+                pct_cusum_alarms=0.0,
+                avg_vol_percentile=0.4,
+                target_enabled=True,
+                target_progress=0.1,
+                session_progress=0.2,
+                remaining_loss_budget_fraction=0.9,
+            )
+        )
+        late = derive_trade_topology(
+            ScreenContext(
+                n_universe=500,
+                pct_cusum_alarms=0.0,
+                avg_vol_percentile=0.4,
+                target_enabled=True,
+                target_progress=0.1,
+                session_progress=0.9,
+                remaining_loss_budget_fraction=0.9,
+            )
+        )
+        turbulent = derive_trade_topology(
+            ScreenContext(n_universe=500, pct_cusum_alarms=0.5, avg_vol_percentile=0.9)
+        )
+        self.assertEqual(early.risk_multiplier, 1.15)
+        self.assertEqual(late.risk_multiplier, 1.0)  # no late-session target chasing
+        self.assertLess(turbulent.risk_multiplier, 1.0)
+
+        managed = ManagedScreen(sources={"static": StaticPolicySource()})
+        result, _ = managed.screen(
+            self._universe(),
+            PortfolioContext(
+                target_enabled=True,
+                target_progress=0.1,
+                session_progress=0.2,
+                remaining_loss_budget_fraction=0.9,
+            ),
+        )
+        self.assertIsNotNone(result.topology)
+        self.assertEqual(result.topology.risk_multiplier, 1.15)
+
+    def test_execution_enforces_entropy_and_bounded_risk_multiplier(self) -> None:
+        market = MarketState(
+            close=100.0, ema_200=90.0, stoch_k=80.0, stoch_d=70.0,
+            atr_14=2.0, long_stop=98.0, short_stop=102.0, htf_ema=90.0,
+            signal=1, long_structure_confirmed=True,
+        )
+        uncertain = Decision(
+            action="BUY",
+            probabilities={"BUY": 0.35, "SELL": 0.33, "HOLD": 0.32},
+            logits={"BUY": 1.0, "SELL": 0.9, "HOLD": 0.8},
+            confidence=0.35, prompt="test", source="test", market=market,
+        )
+        self.assertGreater(normalized_decision_entropy(uncertain.probabilities), 0.95)
+        risk = PropFirmRiskManager(starting_equity=10_000.0, point_value=1.0)
+        blocked = build_execution_payload(
+            uncertain, risk, max_decision_entropy=0.80, max_holding_bars=6
+        )
+        self.assertFalse(blocked.approved)
+        self.assertIn("entropy", blocked.reason)
+        self.assertEqual(blocked.max_holding_bars, 6)
+
+        certain = Decision(
+            action="BUY",
+            probabilities={"BUY": 0.90, "SELL": 0.05, "HOLD": 0.05},
+            logits={"BUY": 3.0, "SELL": 0.0, "HOLD": 0.0},
+            confidence=0.90, prompt="test", source="test", market=market,
+        )
+        sized = build_execution_payload(
+            certain, risk, manager_risk_multiplier=1.20, max_holding_bars=8
+        )
+        self.assertTrue(sized.approved)
+        self.assertAlmostEqual(sized.risk_dollars, 60.0)
+        self.assertEqual(sized.max_holding_bars, 8)
+        invalid = risk.size_position(2.0, manager_risk_multiplier=1.21)
+        self.assertTrue(invalid.blocked)
+
+    def test_manager_envelope_term_changes_re_evaluation_without_extra_inference(self) -> None:
+        def state(close: float) -> MarketState:
+            return MarketState(
+                close=close, ema_200=90.0, stoch_k=70.0, stoch_d=60.0,
+                atr_14=1.0, long_stop=close - 1.0, short_stop=close + 1.0,
+                htf_ema=90.0, signal=1, long_structure_confirmed=True,
+            )
+
+        narrow = DiscreteDeviationTrigger(horizon=12, envelope_atr_multiplier=1.0)
+        wide = DiscreteDeviationTrigger(horizon=12, envelope_atr_multiplier=1.0)
+        self.assertTrue(narrow.observe(state(100.0), manager_multiplier=0.70))
+        self.assertTrue(wide.observe(state(100.0), manager_multiplier=1.40))
+        # The same 0.8 ATR deviation breaches the narrow mandate but not the
+        # wide one; this is arithmetic in the existing trigger, not an LLM call.
+        self.assertTrue(narrow.observe(state(100.8), manager_multiplier=0.70))
+        self.assertFalse(wide.observe(state(100.8), manager_multiplier=1.40))
 
     def test_feedback_before_screen_raises(self) -> None:
         managed = ManagedScreen(sources={"a": StaticPolicySource()})

@@ -85,6 +85,8 @@ class PropFirmRiskManager:
     max_target_confidence: float = 0.80
     confidence_escalation_progress: float = 0.75
     target_risk_floor_multiplier: float = 0.25
+    manager_risk_multiplier_floor: float = 0.25
+    manager_risk_multiplier_cap: float = 1.20
     session_progress: float = 0.0
     equity: float = field(init=False)
     session_start_equity: float = field(init=False)
@@ -121,6 +123,8 @@ class PropFirmRiskManager:
             raise ValueError("confidence_escalation_progress must be in (0, 1]")
         if not 0 < self.target_risk_floor_multiplier <= 1:
             raise ValueError("target_risk_floor_multiplier must be in (0, 1]")
+        if not 0 < self.manager_risk_multiplier_floor <= self.manager_risk_multiplier_cap:
+            raise ValueError("manager risk multiplier bounds must be positive and ordered")
         self.equity = float(self.starting_equity)
         self.session_start_equity = float(self.starting_equity)
         self.peak_equity = float(self.starting_equity)
@@ -253,6 +257,7 @@ class PropFirmRiskManager:
         equity: Optional[float] = None,
         point_value: Optional[float] = None,
         cost_per_contract: float = 0.0,
+        manager_risk_multiplier: float = 1.0,
     ) -> PositionSize:
         if stop_distance <= 0:
             return PositionSize(
@@ -294,11 +299,29 @@ class PropFirmRiskManager:
                 blocked=True,
                 reason="cost_per_contract cannot be negative",
             )
+        if not (
+            self.manager_risk_multiplier_floor
+            <= manager_risk_multiplier
+            <= self.manager_risk_multiplier_cap
+        ):
+            return PositionSize(
+                quantity=0.0,
+                risk_dollars=0.0,
+                stop_distance=stop_distance,
+                dollar_risk_per_unit=stop_distance * pv + cost_per_contract,
+                blocked=True,
+                reason=(
+                    "manager_risk_multiplier must be within "
+                    f"[{self.manager_risk_multiplier_floor:.2f}, "
+                    f"{self.manager_risk_multiplier_cap:.2f}]"
+                ),
+            )
 
         risk_dollars = (
             mark
             * self.per_trade_risk_pct
             * self.target_risk_multiplier()
+            * manager_risk_multiplier
         )
         allowed, reason = self.can_trade(additional_risk=risk_dollars)
         if not allowed:

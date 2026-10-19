@@ -17,6 +17,7 @@ from pathlib import Path
 from threading import RLock
 
 from .engine import ExecutionPayload
+from .manager import PortfolioAllocation, PortfolioCapacityGuard
 from .risk import PropFirmRiskManager
 
 
@@ -157,11 +158,13 @@ class PaperTradingSafetyController:
         journal_path: str | Path,
         *,
         paper_trading: bool = True,
+        capacity_guard: PortfolioCapacityGuard | None = None,
     ) -> None:
         self.risk = risk
         self.paper_trading = paper_trading
         self.journal = SafetyJournal(journal_path)
         self.connection_healthy = False
+        self.capacity_guard = capacity_guard
 
     def mark_connection_healthy(self) -> None:
         """Call only after broker authentication and position reconciliation."""
@@ -191,7 +194,15 @@ class PaperTradingSafetyController:
             raise RuntimeError("cannot clear a session halt while the risk manager is locked")
         self.journal.clear_session_halt()
 
-    def authorize(self, payload: ExecutionPayload, client_order_id: str) -> OrderAuthorization:
+    def authorize(
+        self,
+        payload: ExecutionPayload,
+        client_order_id: str,
+        *,
+        symbol: str | None = None,
+        sector: str | None = None,
+        correlations: dict[str, float] | None = None,
+    ) -> OrderAuthorization:
         """Reserve a unique order ID when an approved paper order may be sent."""
         client_order_id = client_order_id.strip()
         if not client_order_id:
@@ -215,7 +226,27 @@ class PaperTradingSafetyController:
             return OrderAuthorization(False, client_order_id, reason)
         if not payload.approved or payload.action.upper() == "HOLD":
             return OrderAuthorization(False, client_order_id, payload.reason or "payload is not approved")
+        if self.capacity_guard is not None:
+            if not symbol or payload.side is None:
+                return OrderAuthorization(
+                    False, client_order_id, "symbol and side are required for manager capacity checks"
+                )
+            permitted, reason = self.capacity_guard.reserve(
+                PortfolioAllocation(
+                    order_id=client_order_id,
+                    symbol=symbol.upper(),
+                    side=payload.side,
+                    risk_dollars=payload.risk_dollars,
+                    sector=sector,
+                ),
+                self.risk.equity,
+                correlations,
+            )
+            if not permitted:
+                return OrderAuthorization(False, client_order_id, reason)
         if not self.journal.reserve(client_order_id):
+            if self.capacity_guard is not None:
+                self.capacity_guard.release(client_order_id)
             return OrderAuthorization(
                 False,
                 client_order_id,
@@ -225,4 +256,12 @@ class PaperTradingSafetyController:
 
     def record_definitive_rejection(self, client_order_id: str) -> None:
         """Permit a retry only after the broker conclusively rejected the request."""
-        self.journal.release_known_rejection(client_order_id.strip())
+        order_id = client_order_id.strip()
+        self.journal.release_known_rejection(order_id)
+        if self.capacity_guard is not None:
+            self.capacity_guard.release(order_id)
+
+    def release_capacity(self, client_order_id: str) -> None:
+        """Release a manager allocation after a reconciled close or cancellation."""
+        if self.capacity_guard is not None:
+            self.capacity_guard.release(client_order_id.strip())

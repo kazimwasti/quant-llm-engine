@@ -23,10 +23,13 @@ from core.engine import (
     DiscreteDeviationTrigger,
     FeatureLogitBackend,
     MarketState,
+    TradePreflight,
     TorchSequenceClassifierBackend,
     build_execution_payload,
+    confirm_marginal_decision,
     extract_decision,
 )
+from core.manager import TradeTopology
 from core.risk import Platform, PropFirmRiskManager
 from core.strategy import (
     DEFAULT_ATR_TARGET_MULTIPLIER,
@@ -53,10 +56,12 @@ class Simulator:
         ambiguous_fill_policy: str = "conservative",
         random_seed: int = 1729,
         backend=None,
+        confirmation_backend=None,
         daily_profit_target: float | None = 1_000.0,
         deviation_horizon: int = 12,
         deviation_envelope_atr: float = 1.0,
         tick_size: float = 0.25,
+        topology: TradeTopology | None = None,
     ) -> None:
         if initial_balance <= 0 or point_value <= 0:
             raise ValueError("initial_balance and point_value must be positive")
@@ -82,7 +87,9 @@ class Simulator:
         self.ambiguous_bars = 0
         self.ambiguous_stop_fills = 0
         self.backend = backend
+        self.confirmation_backend = confirmation_backend
         self.daily_profit_target = daily_profit_target
+        self.topology = topology
         self.deviation_trigger = DiscreteDeviationTrigger(
             horizon=deviation_horizon,
             envelope_atr_multiplier=deviation_envelope_atr,
@@ -173,7 +180,10 @@ class Simulator:
                 bullish_rejection=bool(row.bullish_rejection),
                 bearish_rejection=bool(row.bearish_rejection),
             )
-            decision_due = self.deviation_trigger.observe(state)
+            decision_due = self.deviation_trigger.observe(
+                state,
+                self.topology.envelope_distance_multiplier if self.topology is not None else 1.0,
+            )
 
             self._manage_position(row, ts)
             equity = self.balance
@@ -196,13 +206,22 @@ class Simulator:
                     self.skipped_evaluations += 1
                     continue
                 self.evaluations += 1
+                required_confidence = max(
+                    self.min_confidence,
+                    self.risk_manager.required_confidence(session_elapsed),
+                    self.topology.min_confidence if self.topology is not None else 0.0,
+                )
                 decision = extract_decision(
                     state,
                     self.backend or FeatureLogitBackend(state),
-                    min_confidence=max(
-                        self.min_confidence,
-                        self.risk_manager.required_confidence(session_elapsed),
-                    ),
+                    min_confidence=required_confidence,
+                    topology=self.topology,
+                )
+                decision = confirm_marginal_decision(
+                    decision,
+                    backend=self.confirmation_backend,
+                    min_confidence=required_confidence,
+                    topology=self.topology,
                 )
                 friction_per_contract = (2 * self.slippage_points * self.point_value
                                          + 2 * self.commission_per_contract)
@@ -211,6 +230,26 @@ class Simulator:
                     self.risk_manager,
                     point_value=self.point_value,
                     cost_per_contract=friction_per_contract,
+                    manager_risk_multiplier=(
+                        self.topology.risk_multiplier if self.topology is not None else 1.0
+                    ),
+                    max_holding_bars=(
+                        self.topology.max_holding_bars if self.topology is not None else None
+                    ),
+                    max_decision_entropy=(
+                        self.topology.max_decision_entropy if self.topology is not None else None
+                    ),
+                    topology=self.topology,
+                    preflight=(
+                        TradePreflight(
+                            data_age_seconds=0.0,
+                            spread_bps=(self.slippage_points / max(float(row.close), 1e-12)) * 10_000,
+                            estimated_impact_bps=0.0,
+                            order_volume_fraction=0.0,
+                        )
+                        if self.topology is not None
+                        else None
+                    ),
                 )
                 if payload.approved and payload.size is not None:
                     self.risk_manager.reserve_open_risk(payload.size)
@@ -221,6 +260,7 @@ class Simulator:
                         "target_distance": DEFAULT_ATR_TARGET_MULTIPLIER * float(row.atr_14),
                         "entry_atr": float(row.atr_14),
                         "signal_time": ts,
+                        "max_holding_bars": payload.max_holding_bars,
                     }
 
         if self.position is not None:
@@ -251,6 +291,8 @@ class Simulator:
             "breakeven_active": False,
             "entry_time": timestamp,
             "signal_time": pending["signal_time"],
+            "max_holding_bars": pending.get("max_holding_bars"),
+            "bars_held": 0,
         }
         self.pending_order = None
 
@@ -268,6 +310,12 @@ class Simulator:
             return
         p = self.position
         o, h, l, c = (float(getattr(row, name)) for name in ("open", "high", "low", "close"))
+        if (
+            p.get("max_holding_bars") is not None
+            and p.get("bars_held", 0) >= p["max_holding_bars"]
+        ):
+            self._close(o, "manager_time_limit", timestamp)
+            return
         is_long = p["action"] == "BUY"
         if (is_long and o <= p["stop"]) or (not is_long and o >= p["stop"]):
             self._close(o, "breakeven" if p["breakeven_active"] else "stop", timestamp)
@@ -323,6 +371,7 @@ class Simulator:
                     reason = "breakeven" if p["breakeven_active"] else "stop"
                     self._close(p["stop"], reason, timestamp)
                     return
+        p["bars_held"] = p.get("bars_held", 0) + 1
 
     def _resolve_ambiguous_bar(self, position: dict, timestamp) -> None:
         """Resolve both-barrier OHLC bars without assuming favorable tick order."""
@@ -362,6 +411,8 @@ class Simulator:
                             "breakeven_active": p["breakeven_active"],
                             "breakeven_time": p.get("breakeven_time"),
                             "signal_time": p.get("signal_time"),
+                             "max_holding_bars": p.get("max_holding_bars"),
+                             "bars_held": p.get("bars_held", 0),
                             "balance": self.balance})
         self.position = None
 

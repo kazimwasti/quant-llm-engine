@@ -8,6 +8,7 @@ import unittest
 import pandas as pd
 
 from backtest.backtest import Simulator
+from core.manager import TradeTopology
 from core.strategy import align_higher_timeframe_ema
 
 
@@ -92,6 +93,34 @@ class BacktestIntegrityTests(unittest.TestCase):
         self.assertEqual(simulator.position["target"], 127.25)
         self.assertEqual(simulator.position["entry_time"], fill_time)
         self.assertEqual(simulator.position["signal_time"], signal_time)
+
+    def test_manager_holding_limit_forces_flat_at_next_bar_open(self) -> None:
+        simulator = Simulator(
+            initial_balance=1_000.0,
+            point_value=1.0,
+            commission_per_contract=0.0,
+            topology=TradeTopology(max_holding_bars=1),
+        )
+        simulator.position = {
+            "action": "BUY",
+            "quantity": 1,
+            "entry": 100.0,
+            "stop": 90.0,
+            "target": 110.0,
+            "risk_dollars": 10.0,
+            "entry_atr": 10.0,
+            "breakeven_active": False,
+            "entry_time": pd.Timestamp("2026-01-01", tz="UTC"),
+            "max_holding_bars": 1,
+            "bars_held": 1,
+        }
+        simulator._manage_position(
+            SimpleNamespace(open=101.0, high=102.0, low=100.5, close=101.0),
+            pd.Timestamp("2026-01-01 00:10", tz="UTC"),
+        )
+        self.assertIsNone(simulator.position)
+        self.assertEqual(simulator.trades[-1]["reason"], "manager_time_limit")
+        self.assertEqual(simulator.trades[-1]["exit"], 101.0)
 
 
 if __name__ == "__main__":
