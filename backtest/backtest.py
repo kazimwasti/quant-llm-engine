@@ -29,7 +29,7 @@ from core.engine import (
     confirm_marginal_decision,
     extract_decision,
 )
-from core.manager import TradeTopology
+from core.manager import ReentryCooldown, TradeTopology
 from core.risk import Platform, PropFirmRiskManager
 from core.strategy import (
     DEFAULT_ATR_TARGET_MULTIPLIER,
@@ -90,6 +90,9 @@ class Simulator:
         self.confirmation_backend = confirmation_backend
         self.daily_profit_target = daily_profit_target
         self.topology = topology
+        self.cooldown = ReentryCooldown(topology) if topology is not None else None
+        self.cooldown_blocked_evaluations = 0
+        self._current_bar = 0
         self.deviation_trigger = DiscreteDeviationTrigger(
             horizon=deviation_horizon,
             envelope_atr_multiplier=deviation_envelope_atr,
@@ -148,6 +151,7 @@ class Simulator:
         timestamp_values = tuple(timestamps)
         for i, row in enumerate(df.itertuples(index=False)):
             ts = timestamp_values[i]
+            self._current_bar = i
             local_ts = ts.tz_convert("America/New_York") if pd.notna(ts) and getattr(ts, "tzinfo", None) else ts
             session = (local_ts - pd.Timedelta(hours=18)).date() if pd.notna(local_ts) and hasattr(local_ts, "date") else None
             if previous_session is not None and session is not None and session != previous_session:
@@ -205,6 +209,16 @@ class Simulator:
                 if not decision_due:
                     self.skipped_evaluations += 1
                     continue
+                if self.cooldown is not None:
+                    cooldown_active, cooldown_reason = self.cooldown.blocked(
+                        self.symbol, self._current_bar
+                    )
+                    if cooldown_active:
+                        self.cooldown_blocked_evaluations += 1
+                        logger.info(
+                            "Skipping evaluation during re-entry cooldown: %s", cooldown_reason
+                        )
+                        continue
                 self.evaluations += 1
                 required_confidence = max(
                     self.min_confidence,
@@ -404,6 +418,8 @@ class Simulator:
             pnl,
             stop_out=reason in {"stop", "ambiguous_stop"} and pnl < 0,
         )
+        if self.cooldown is not None and reason in {"stop", "ambiguous_stop"} and pnl < 0:
+            self.cooldown.record_stopout(self.symbol, self._current_bar)
         self.trades.append({"entry_time": p["entry_time"], "exit_time": timestamp,
                             "symbol": self.symbol, "side": p["action"], "entry": p["entry"],
                             "exit": exit_price, "quantity": p["quantity"], "pnl": pnl,
@@ -446,6 +462,7 @@ class Simulator:
             "backend": "qwen_lora" if self.backend is not None else "feature_fallback",
             "model_evaluations": self.evaluations,
             "skipped_evaluations": self.skipped_evaluations,
+            "cooldown_blocked_evaluations": self.cooldown_blocked_evaluations,
             "daily_profit_target": self.risk_manager.daily_profit_target,
             "required_confidence_now": self.risk_manager.required_confidence(),
             "consecutive_stopouts": self.risk_manager.consecutive_stopouts,

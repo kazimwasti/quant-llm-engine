@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -23,11 +24,15 @@ from core.manager import (
     BanditHarness,
     LLMPolicySource,
     ManagedScreen,
+    PortfolioAllocation,
+    PortfolioCapacityGuard,
     PortfolioContext,
+    ReentryCooldown,
     ScreenerConfig,
     ScreenContext,
     HeuristicPolicySource,
     StaticPolicySource,
+    TradeTopology,
     derive_trade_topology,
     run_screen,
 )
@@ -35,7 +40,10 @@ from core.engine import (
     Decision,
     DiscreteDeviationTrigger,
     MarketState,
+    TradePreflight,
     build_execution_payload,
+    confirm_marginal_decision,
+    format_decision_prompt,
     normalized_decision_entropy,
 )
 from core.risk import PropFirmRiskManager
@@ -422,6 +430,174 @@ class ManagerPipelineTests(unittest.TestCase):
         managed = ManagedScreen(sources={"a": StaticPolicySource()})
         with self.assertRaises(RuntimeError):
             managed.feedback(1.0)
+
+    def test_portfolio_capacity_guard_enforces_capacity_limits(self) -> None:
+        topology = TradeTopology(
+            max_open_positions=4,
+            max_gross_risk_fraction=0.015,
+            max_net_directional_risk_fraction=0.010,
+            max_sector_positions=2,
+            max_correlated_positions=2,
+        )
+        guard = PortfolioCapacityGuard(topology)
+        equity = 10_000.0  # gross-risk cap 150, net-directional cap 100
+
+        self.assertTrue(
+            guard.reserve(
+                PortfolioAllocation("o1", "AAA", "long", 90.0, sector="tech"), equity
+            )[0]
+        )
+        # A second long would breach the 100 net-directional cap.
+        blocked, reason = guard.check(
+            PortfolioAllocation("o2", "BBB", "long", 20.0, sector="tech"), equity
+        )
+        self.assertFalse(blocked)
+        self.assertIn("net directional", reason)
+        # The opposite side fits: gross 110 <= 150, net |70| <= 100.
+        self.assertTrue(
+            guard.reserve(PortfolioAllocation("o2", "BBB", "short", 20.0, sector="tech"), equity)[0]
+        )
+        # A third tech position breaches the sector cap.
+        blocked, reason = guard.check(
+            PortfolioAllocation("o3", "CCC", "long", 5.0, sector="tech"), equity
+        )
+        self.assertFalse(blocked)
+        self.assertIn("sector", reason)
+        # The cluster cap counts the cluster: two existing correlated names
+        # already fill a cap of two, so a third correlated entry is refused.
+        blocked, reason = guard.check(
+            PortfolioAllocation("o4", "DDD", "long", 5.0),
+            equity,
+            correlations={"AAA": 0.9, "BBB": 0.9},
+        )
+        self.assertFalse(blocked)
+        self.assertIn("correlated", reason)
+        # A duplicate order id can never reserve twice.
+        duplicate, reason = guard.check(PortfolioAllocation("o1", "AAA", "long", 1.0), equity)
+        self.assertFalse(duplicate)
+        self.assertIn("duplicate", reason)
+        self.assertEqual(len(guard.allocations()), 2)
+        guard.release("o1")
+        self.assertEqual(len(guard.allocations()), 1)
+
+    def test_reentry_cooldown_blocks_then_expires(self) -> None:
+        cooldown = ReentryCooldown(TradeTopology(reentry_cooldown_bars=6))
+        cooldown.record_stopout("AAA", bar=10)
+        blocked, reason = cooldown.blocked("AAA", bar=15)
+        self.assertTrue(blocked)
+        self.assertIn("cooldown", reason)
+        self.assertFalse(cooldown.blocked("AAA", bar=16)[0])  # six bars elapsed
+        # Correlated symbols share the cooldown; uncorrelated ones do not.
+        self.assertTrue(cooldown.blocked("BBB", bar=12, correlations={"AAA": 0.9})[0])
+        self.assertFalse(cooldown.blocked("BBB", bar=12, correlations={"AAA": 0.5})[0])
+        # A fresh stop-out resets the clock to the later bar.
+        cooldown.record_stopout("AAA", bar=20)
+        self.assertTrue(cooldown.blocked("AAA", bar=25)[0])
+        cooldown.clear("AAA")
+        self.assertFalse(cooldown.blocked("AAA", bar=21)[0])
+
+    def test_preflight_gates_and_thesis_record(self) -> None:
+        market = MarketState(
+            close=100.0, ema_200=90.0, stoch_k=80.0, stoch_d=70.0,
+            atr_14=2.0, long_stop=98.0, short_stop=102.0, htf_ema=90.0,
+            signal=1, long_structure_confirmed=True,
+        )
+        certain = Decision(
+            action="BUY",
+            probabilities={"BUY": 0.90, "SELL": 0.05, "HOLD": 0.05},
+            logits={"BUY": 3.0, "SELL": 0.0, "HOLD": 0.0},
+            confidence=0.90, prompt="test", source="test", market=market,
+        )
+        risk = PropFirmRiskManager(starting_equity=10_000.0, point_value=1.0)
+        topology = TradeTopology()
+        preflight = TradePreflight(
+            data_age_seconds=0.0,
+            spread_bps=5.0,
+            estimated_impact_bps=5.0,
+            order_volume_fraction=0.001,
+        )
+        approved = build_execution_payload(certain, risk, topology=topology, preflight=preflight)
+        self.assertTrue(approved.approved)
+        self.assertIsNotNone(approved.thesis)
+        self.assertEqual(approved.thesis.style, topology.style_preference)
+        self.assertAlmostEqual(approved.thesis.invalidation_price, approved.stop_price)
+        self.assertGreater(approved.thesis.review_after_bars, 0)
+        self.assertIn("re-entry cooldown", format_decision_prompt(market, topology).lower())
+
+        stale = build_execution_payload(
+            certain, risk, topology=topology,
+            preflight=replace(preflight, data_age_seconds=120.0),
+        )
+        self.assertFalse(stale.approved)
+        self.assertIn("stale", stale.reason)
+        self.assertTrue(stale.source.endswith("+preflight_blocked"))
+
+        halted = build_execution_payload(
+            certain, risk, topology=topology,
+            preflight=replace(preflight, trading_halted=True),
+        )
+        self.assertFalse(halted.approved)
+        self.assertIn("halt", halted.reason)
+
+        wide = build_execution_payload(
+            certain, risk, topology=topology,
+            preflight=replace(preflight, spread_bps=50.0),
+        )
+        self.assertFalse(wide.approved)
+        self.assertIn("spread", wide.reason)
+
+        missing = build_execution_payload(certain, risk, topology=topology, preflight=None)
+        self.assertFalse(missing.approved)
+        self.assertIn("requires a market-data preflight", missing.reason)
+
+    def test_model_disagreement_fails_closed_on_marginal_decisions(self) -> None:
+        class ScriptedBackend:
+            def __init__(self, scores: dict[str, float]) -> None:
+                self.scores = scores
+                self.calls = 0
+
+            def score_actions(self, prompt, actions):
+                self.calls += 1
+                return dict(self.scores)
+
+        market = MarketState(
+            close=100.0, ema_200=90.0, stoch_k=80.0, stoch_d=70.0,
+            atr_14=2.0, long_stop=98.0, short_stop=102.0, htf_ema=90.0,
+            signal=1, long_structure_confirmed=True,
+        )
+        strong = Decision(
+            action="BUY",
+            probabilities={"BUY": 0.90, "SELL": 0.05, "HOLD": 0.05},
+            logits={"BUY": 3.0, "SELL": 0.0, "HOLD": 0.0},
+            confidence=0.90, prompt="p", source="t", market=market,
+        )
+        topology = TradeTopology(confirmation_band=0.07)  # marginal band: 0.65-0.72
+
+        # Clear decisions skip the second scorer entirely (Jev one-shot path).
+        agree = ScriptedBackend({"BUY": 4.0, "SELL": 0.0, "HOLD": 0.0})
+        kept = confirm_marginal_decision(strong, backend=agree, min_confidence=0.65, topology=topology)
+        self.assertEqual(kept.action, "BUY")
+        self.assertEqual(agree.calls, 0)
+
+        marginal = replace(
+            strong,
+            confidence=0.68,
+            probabilities={"BUY": 0.68, "SELL": 0.02, "HOLD": 0.30},
+        )
+        disagree = ScriptedBackend({"BUY": 0.0, "SELL": 4.0, "HOLD": 0.0})
+        blocked = confirm_marginal_decision(
+            marginal, backend=disagree, min_confidence=0.65, topology=topology
+        )
+        self.assertEqual(disagree.calls, 1)
+        self.assertEqual(blocked.action, "HOLD")
+        self.assertIn("model_disagreement_blocked", blocked.source)
+
+        confirm = ScriptedBackend({"BUY": 4.0, "SELL": 0.0, "HOLD": 0.0})
+        confirmed = confirm_marginal_decision(
+            marginal, backend=confirm, min_confidence=0.65, topology=topology
+        )
+        self.assertEqual(confirmed.action, "BUY")
+        self.assertIn("secondary_confirmed", confirmed.source)
 
 
 if __name__ == "__main__":

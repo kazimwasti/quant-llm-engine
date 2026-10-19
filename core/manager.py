@@ -330,6 +330,7 @@ class TradeTopology:
     max_spread_bps: float = 15.0
     max_impact_bps: float = 12.0
     max_order_volume_fraction: float = 0.01
+    reentry_cooldown_bars: int = 6
     rationale: str = "normal market conditions"
 
     def __post_init__(self) -> None:
@@ -361,6 +362,8 @@ class TradeTopology:
             raise ValueError("execution-quality thresholds must be non-negative")
         if not 0 < self.max_order_volume_fraction <= 0.10:
             raise ValueError("max_order_volume_fraction must be in (0, 0.10]")
+        if not 0 <= self.reentry_cooldown_bars <= 48:
+            raise ValueError("reentry_cooldown_bars must be between 0 and 48")
 
 
 def derive_trade_topology(context: ScreenContext) -> TradeTopology:
@@ -477,7 +480,10 @@ class PortfolioCapacityGuard:
                 >= self.topology.correlation_capacity_threshold
                 for item in open_allocations
             )
-            if correlated_count > self.topology.max_correlated_positions:
+            # Count the candidate itself: a cluster of ``max`` must not grow to
+            # ``max + 1``.  max(1, ...) keeps a zero limit meaning "no cluster
+            # beyond the candidate alone" instead of "block everything".
+            if correlated_count >= max(1, self.topology.max_correlated_positions):
                 return False, "manager correlated-position capacity reached"
             return True, ""
 
@@ -500,6 +506,58 @@ class PortfolioCapacityGuard:
     def allocations(self) -> tuple[PortfolioAllocation, ...]:
         with self._lock:
             return tuple(self._allocations.values())
+
+
+class ReentryCooldown:
+    """Turnover budget: a stop-out delays re-entry, then stops blocking.
+
+    After a stop-out, entries in the same symbol -- or in a symbol correlated
+    with it at or beyond ``correlation_capacity_threshold`` -- are blocked for
+    ``reentry_cooldown_bars`` bars.  The cooldown then expires on its own, so a
+    genuinely strong later setup is only delayed, never forbidden.  Checks are
+    dict lookups over the small stopped-symbol set; no model inference,
+    feature computation, or extra market-data requests.
+    """
+
+    def __init__(self, topology: TradeTopology) -> None:
+        self.topology = topology
+        self._stopout_bars: dict[str, int] = {}
+        self._lock = RLock()
+
+    def record_stopout(self, symbol: str, bar: int) -> None:
+        symbol = symbol.upper()
+        with self._lock:
+            current = self._stopout_bars.get(symbol)
+            if current is None or bar >= current:
+                self._stopout_bars[symbol] = bar
+
+    def blocked(
+        self,
+        symbol: str,
+        bar: int,
+        correlations: Optional[Mapping[str, float]] = None,
+    ) -> tuple[bool, str]:
+        symbol = symbol.upper()
+        with self._lock:
+            own = self._stopout_bars.get(symbol)
+            if own is not None and bar - own < self.topology.reentry_cooldown_bars:
+                remaining = self.topology.reentry_cooldown_bars - (bar - own)
+                return True, f"re-entry cooldown for {symbol}: {remaining} bars remaining after stop-out"
+            correlations = correlations or {}
+            for stopped, stop_bar in self._stopout_bars.items():
+                if stopped == symbol or bar - stop_bar >= self.topology.reentry_cooldown_bars:
+                    continue
+                if abs(float(correlations.get(stopped, 0.0))) >= self.topology.correlation_capacity_threshold:
+                    remaining = self.topology.reentry_cooldown_bars - (bar - stop_bar)
+                    return True, (
+                        f"re-entry cooldown for correlated {stopped}: "
+                        f"{remaining} bars remaining after stop-out"
+                    )
+            return False, ""
+
+    def clear(self, symbol: str) -> None:
+        with self._lock:
+            self._stopout_bars.pop(symbol.upper(), None)
 
 
 class PolicySource(Protocol):

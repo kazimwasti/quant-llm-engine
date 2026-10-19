@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
+import numpy as np
 import pandas as pd
 
+import backtest.backtest as backtest_module
 from backtest.backtest import Simulator
 from core.manager import TradeTopology
 from core.strategy import align_higher_timeframe_ema
@@ -121,6 +125,83 @@ class BacktestIntegrityTests(unittest.TestCase):
         self.assertIsNone(simulator.position)
         self.assertEqual(simulator.trades[-1]["reason"], "manager_time_limit")
         self.assertEqual(simulator.trades[-1]["exit"], 101.0)
+
+    def test_stopout_records_a_reentry_cooldown(self) -> None:
+        simulator = Simulator(
+            initial_balance=1_000.0,
+            point_value=1.0,
+            commission_per_contract=0.0,
+            topology=TradeTopology(reentry_cooldown_bars=6),
+        )
+        simulator.position = {
+            "action": "BUY",
+            "quantity": 1,
+            "entry": 100.0,
+            "stop": 90.0,
+            "target": 110.0,
+            "risk_dollars": 10.0,
+            "entry_atr": 10.0,
+            "breakeven_active": False,
+            "entry_time": pd.Timestamp("2026-01-01", tz="UTC"),
+            "bars_held": 0,
+        }
+        simulator._current_bar = 7
+        simulator._manage_position(
+            SimpleNamespace(open=95.0, high=96.0, low=89.0, close=90.0),
+            pd.Timestamp("2026-01-01 00:05", tz="UTC"),
+        )
+        self.assertEqual(simulator.trades[-1]["reason"], "stop")
+        blocked, _ = simulator.cooldown.blocked(simulator.symbol, bar=10)
+        self.assertTrue(blocked)
+        self.assertFalse(simulator.cooldown.blocked(simulator.symbol, bar=13)[0])
+
+    def test_stopout_cooldown_skips_model_evaluation(self) -> None:
+        rng = np.random.default_rng(11)
+        closes = 100.0 + np.cumsum(rng.standard_normal(320)) * 0.1
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-02 18:00", periods=320, freq="5min", tz="UTC"),
+                "open": closes,
+                "high": closes + 0.2,
+                "low": closes - 0.2,
+                "close": closes,
+                "volume": 1_000.0,
+            }
+        )
+        simulator = Simulator(
+            initial_balance=1_000.0,
+            point_value=1.0,
+            commission_per_contract=0.0,
+            topology=TradeTopology(),
+        )
+        # The real stop-out recording path is exercised in
+        # test_stopout_records_a_reentry_cooldown; here a wide test window
+        # stands in for a cooldown long enough to cover the whole frame, since
+        # decisions only begin after the 200-bar EMA warmup.
+        class TestCooldown:
+            def blocked(self, symbol, bar, correlations=None):
+                return True, "cooldown active for test"
+
+            def record_stopout(self, symbol, bar):
+                pass
+
+        simulator.cooldown = TestCooldown()
+        calls = []
+        original = backtest_module.extract_decision
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        backtest_module.extract_decision = counted
+        try:
+            with tempfile.TemporaryDirectory(prefix="cooldown-test-") as tmp:
+                simulator.run_backtest(frame, output_prefix=str(Path(tmp) / "cooldown"))
+        finally:
+            backtest_module.extract_decision = original
+        # The whole cooldown never reaches the decision scorer: zero inference.
+        self.assertEqual(calls, [])
+        self.assertGreater(simulator.cooldown_blocked_evaluations, 0)
 
 
 if __name__ == "__main__":

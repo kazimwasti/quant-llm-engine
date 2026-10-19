@@ -225,6 +225,7 @@ def format_decision_prompt(state: MarketState, topology: Optional[TradeTopology]
             f"- Maximum normalized decision entropy: {topology.max_decision_entropy:.2f}.\n"
             f"- Re-evaluation envelope multiplier: {topology.envelope_distance_multiplier:.2f}x.\n"
             f"- Preferred style: {topology.style_preference}.\n"
+            f"- Re-entry cooldown after a stop-out: {topology.reentry_cooldown_bars} bars.\n"
             f"- Context: {topology.rationale}\n"
         )
     return (

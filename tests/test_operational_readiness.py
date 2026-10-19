@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from core.engine import Decision, ExecutionPayload, MarketState
+from core.manager import PortfolioCapacityGuard, ReentryCooldown, TradeTopology
 from core.operations import PaperTradingSafetyController
 from core.risk import PropFirmRiskManager
 
@@ -139,6 +140,39 @@ class OperationalReadinessTests(unittest.TestCase):
         self.assertTrue(controller.authorize(self.payload, "retry-1").permitted)
         controller.record_definitive_rejection("retry-1")
         self.assertTrue(controller.authorize(self.payload, "retry-1").permitted)
+
+    def test_manager_capacity_and_cooldown_gate_authorization(self) -> None:
+        topology = TradeTopology()
+        controller = self.controller(
+            capacity_guard=PortfolioCapacityGuard(topology),
+            cooldown=ReentryCooldown(topology),
+        )
+        # Manager gates fail closed without the context they need.
+        no_symbol = controller.authorize(self.payload, "ctx-1")
+        self.assertFalse(no_symbol.permitted)
+        no_bar = controller.authorize(self.payload, "ctx-2", symbol="MNQ")
+        self.assertFalse(no_bar.permitted)
+        self.assertIn("cooldown", no_bar.reason)
+
+        # A normal authorization passes both gates and reserves capacity.
+        self.assertTrue(controller.authorize(self.payload, "ctx-3", symbol="MNQ", bar=0).permitted)
+
+        # A stop-out starts the symbol cooldown; inside the window orders wait.
+        controller.record_stopout("MNQ", bar=2)
+        blocked = controller.authorize(self.payload, "ctx-4", symbol="MNQ", bar=5)
+        self.assertFalse(blocked.permitted)
+        self.assertIn("cooldown", blocked.reason)
+
+        # Correlated symbols inherit the cooldown until it expires.
+        correlated = controller.authorize(
+            self.payload, "ctx-5", symbol="ES", bar=5, correlations={"MNQ": 0.95}
+        )
+        self.assertFalse(correlated.permitted)
+        self.assertIn("cooldown", correlated.reason)
+        expired = controller.authorize(
+            self.payload, "ctx-6", symbol="ES", bar=8, correlations={"MNQ": 0.95}
+        )
+        self.assertTrue(expired.permitted)
 
 
 if __name__ == "__main__":

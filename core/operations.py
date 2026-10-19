@@ -17,7 +17,7 @@ from pathlib import Path
 from threading import RLock
 
 from .engine import ExecutionPayload
-from .manager import PortfolioAllocation, PortfolioCapacityGuard
+from .manager import PortfolioAllocation, PortfolioCapacityGuard, ReentryCooldown
 from .risk import PropFirmRiskManager
 
 
@@ -159,12 +159,14 @@ class PaperTradingSafetyController:
         *,
         paper_trading: bool = True,
         capacity_guard: PortfolioCapacityGuard | None = None,
+        cooldown: ReentryCooldown | None = None,
     ) -> None:
         self.risk = risk
         self.paper_trading = paper_trading
         self.journal = SafetyJournal(journal_path)
         self.connection_healthy = False
         self.capacity_guard = capacity_guard
+        self.cooldown = cooldown
 
     def mark_connection_healthy(self) -> None:
         """Call only after broker authentication and position reconciliation."""
@@ -202,6 +204,7 @@ class PaperTradingSafetyController:
         symbol: str | None = None,
         sector: str | None = None,
         correlations: dict[str, float] | None = None,
+        bar: int | None = None,
     ) -> OrderAuthorization:
         """Reserve a unique order ID when an approved paper order may be sent."""
         client_order_id = client_order_id.strip()
@@ -226,6 +229,16 @@ class PaperTradingSafetyController:
             return OrderAuthorization(False, client_order_id, reason)
         if not payload.approved or payload.action.upper() == "HOLD":
             return OrderAuthorization(False, client_order_id, payload.reason or "payload is not approved")
+        if self.cooldown is not None:
+            if not symbol or bar is None:
+                return OrderAuthorization(
+                    False,
+                    client_order_id,
+                    "symbol and bar are required for manager re-entry cooldown checks",
+                )
+            cooldown_active, reason = self.cooldown.blocked(symbol, int(bar), correlations)
+            if cooldown_active:
+                return OrderAuthorization(False, client_order_id, reason)
         if self.capacity_guard is not None:
             if not symbol or payload.side is None:
                 return OrderAuthorization(
@@ -265,3 +278,13 @@ class PaperTradingSafetyController:
         """Release a manager allocation after a reconciled close or cancellation."""
         if self.capacity_guard is not None:
             self.capacity_guard.release(client_order_id.strip())
+
+    def record_stopout(self, symbol: str, bar: int) -> None:
+        """Register a stop-out so the manager cooldown delays cluster re-entry."""
+        if self.cooldown is not None:
+            self.cooldown.record_stopout(symbol, int(bar))
+
+    def clear_reentry_cooldown(self, symbol: str) -> None:
+        """Drop a symbol's stop-out record after an operator review."""
+        if self.cooldown is not None:
+            self.cooldown.clear(symbol)
