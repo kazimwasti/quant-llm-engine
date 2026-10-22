@@ -404,7 +404,10 @@ class ManagerPipelineTests(unittest.TestCase):
             certain, risk, manager_risk_multiplier=1.20, max_holding_bars=8
         )
         self.assertTrue(sized.approved)
-        self.assertAlmostEqual(sized.risk_dollars, 60.0)
+        # Confidence 0.90 scales the 60-dollar base budget by
+        # 0.25 + (0.90-0.65)/(1-0.65)*0.75 = 0.7857; quantity rounding then
+        # floors the resulting 23.57 contracts to 23.
+        self.assertAlmostEqual(sized.risk_dollars, 46.0)
         self.assertEqual(sized.max_holding_bars, 8)
         invalid = risk.size_position(2.0, manager_risk_multiplier=1.21)
         self.assertTrue(invalid.blocked)

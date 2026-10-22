@@ -39,19 +39,26 @@ print(f'manager dataset OK: {len(rows)} rows, {scored} scored')
     --epochs 4
 
 # ---------------------------------------------------------------------------
-# Arm 1: the decision sub-agent. The committed jev_train_5m.jsonl predates
-# the current prompt format (train_lora.py rejects it), so regenerate the
-# training set from a fresh matched 5m/hourly pair, then train.
+# Phase 2 — decision sub-agent. Regenerate the training set from a fresh
+# matched 5m/hourly cloud pair (the committed JSONL predates the current
+# prompt format), then train. The trainer R-weights its loss: winners teach
+# more, gated-candidate HOLDs weigh full, background HOLDs weigh 0.25.
 # ---------------------------------------------------------------------------
 if TRAIN_DECISION_LLM:
     !python scripts/prepare_cloud_data.py --symbol MNQ=F --test-days 50
     !python scripts/dataset_generator.py \
         --input data/5m_cloud.csv --hourly-input data/hourly_cloud.csv \
         --output data/jev_train_cloud.jsonl
+    import json
+    rows = [json.loads(line) for line in open('data/jev_train_cloud.jsonl', encoding='utf-8')]
+    with_r = sum(1 for r in rows if r.get('meta', {}).get('realized_r') is not None)
+    assert with_r >= 20, f'expected realized_r barrier outcomes, got {with_r}'
+    print(f'decision dataset OK: {len(rows)} rows, {with_r} with realized_r outcomes')
     !python scripts/train_lora.py \
         --data data/jev_train_cloud.jsonl \
         --output-dir models/qwen_adapter \
-        --epochs 3
+        --epochs 3 \
+        --r-weight-scale 1.0 --hold-weight 0.25
 
 # ---------------------------------------------------------------------------
 # Package both adapters for download / dataset upload.

@@ -3,7 +3,8 @@
 Applies to TopstepX, Apex, and other evaluation / live prop platforms.
 
 Hard rules (always on, cannot be loosened):
-- 0.5% of current equity risked per trade
+- 0.5% of current equity risked per trade, scaled down (never up) by the
+  decision's calibrated confidence between ``min_confidence_scale`` and 1.0
 - 2.0% of session starting equity daily-loss circuit breaker
 
 A platform may impose a *tighter* daily loss cap; it cannot raise the 2.0%
@@ -85,6 +86,7 @@ class PropFirmRiskManager:
     max_target_confidence: float = 0.80
     confidence_escalation_progress: float = 0.75
     target_risk_floor_multiplier: float = 0.25
+    min_confidence_scale: float = 0.25
     manager_risk_multiplier_floor: float = 0.25
     manager_risk_multiplier_cap: float = 1.20
     session_progress: float = 0.0
@@ -123,6 +125,8 @@ class PropFirmRiskManager:
             raise ValueError("confidence_escalation_progress must be in (0, 1]")
         if not 0 < self.target_risk_floor_multiplier <= 1:
             raise ValueError("target_risk_floor_multiplier must be in (0, 1]")
+        if not 0 < self.min_confidence_scale <= 1:
+            raise ValueError("min_confidence_scale must be in (0, 1]")
         if not 0 < self.manager_risk_multiplier_floor <= self.manager_risk_multiplier_cap:
             raise ValueError("manager risk multiplier bounds must be positive and ordered")
         self.equity = float(self.starting_equity)
@@ -217,6 +221,23 @@ class PropFirmRiskManager:
         )
         return 1.0 - fraction * (1.0 - self.target_risk_floor_multiplier)
 
+    def confidence_risk_scale(self, confidence: Optional[float]) -> float:
+        """Map calibrated decision confidence onto a risk fraction.
+
+        Linear from ``min_confidence_scale`` at ``baseline_confidence`` up to
+        1.0 at certainty; anything below the baseline clamps to the floor, so
+        risk is only ever scaled *down* by doubt, never up by bravado.
+        ``None`` (legacy callers without a confidence estimate) scales to 1.0.
+        """
+        if confidence is None:
+            return 1.0
+        confidence = float(confidence)
+        span = 1.0 - self.baseline_confidence
+        if span <= 0:
+            return 1.0
+        fraction = min(1.0, max(0.0, (confidence - self.baseline_confidence) / span))
+        return self.min_confidence_scale + fraction * (1.0 - self.min_confidence_scale)
+
     def mark_equity(self, equity: float) -> None:
         if equity < 0:
             raise ValueError("equity cannot be negative")
@@ -258,6 +279,7 @@ class PropFirmRiskManager:
         point_value: Optional[float] = None,
         cost_per_contract: float = 0.0,
         manager_risk_multiplier: float = 1.0,
+        confidence: Optional[float] = None,
     ) -> PositionSize:
         if stop_distance <= 0:
             return PositionSize(
@@ -322,6 +344,7 @@ class PropFirmRiskManager:
             * self.per_trade_risk_pct
             * self.target_risk_multiplier()
             * manager_risk_multiplier
+            * self.confidence_risk_scale(confidence)
         )
         allowed, reason = self.can_trade(additional_risk=risk_dollars)
         if not allowed:

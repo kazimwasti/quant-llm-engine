@@ -6,6 +6,12 @@ starting at the next bar so the signal close is known. The best positive
 directional outcome becomes the label; otherwise the label is HOLD. Session,
 volatility, and higher-timeframe trend gates are carried into the labels.
 
+Every record's ``meta`` carries ``candidate`` (the rule side that fired, if
+any) and ``realized_r`` (the candidate's outcome in stop-distance multiples:
++2.2 for a target, -1.0 for a stop, mark-to-market at expiry for a timeout).
+``scripts/train_lora.py`` weights its loss by ``realized_r`` so trades that
+paid more teach more, while background no-setup HOLD rows are down-weighted.
+
 Each JSONL record reuses ``engine.format_decision_prompt`` so fine-tuning pairs
 match the live logit readout prefix.
 """
@@ -143,13 +149,19 @@ def _first_barrier(
     opens: pd.Series,
     highs: pd.Series,
     lows: pd.Series,
+    closes: pd.Series,
     start: int,
     horizon: int,
     atr_value: float,
     stop_atr_multiplier: float,
     target_atr_multiplier: float,
 ) -> dict[str, dict[str, Any]]:
-    """Return first barrier outcomes, resolving same-bar touches stop-first."""
+    """Return first barrier outcomes, resolving same-bar touches stop-first.
+
+    ``realized_r`` expresses each side's outcome in stop-distance multiples:
+    ``+target/stop`` for a target hit, ``-1.0`` for a stop, and the signed
+    mark-to-market move at expiry for a timeout.
+    """
     end = min(start + horizon, len(highs))
     if start >= end:
         return {}
@@ -164,22 +176,30 @@ def _first_barrier(
         target = entry + sign * target_distance
         reason = "timeout"
         bars_to_outcome = None
+        exit_price = float(closes.iloc[end - 1])
         for offset, idx in enumerate(range(start, end), start=1):
             hit_stop = float(lows.iloc[idx]) <= stop if side == "BUY" else float(highs.iloc[idx]) >= stop
             hit_target = float(highs.iloc[idx]) >= target if side == "BUY" else float(lows.iloc[idx]) <= target
             if hit_stop and hit_target:
                 reason = "same_bar_stop_first"
                 bars_to_outcome = offset
+                exit_price = stop
                 break
             if hit_stop:
                 reason = "stop"
                 bars_to_outcome = offset
+                exit_price = stop
                 break
             if hit_target:
                 reason = "target"
                 bars_to_outcome = offset
+                exit_price = target
                 break
-        outcomes[side] = {"reason": reason, "bars_to_outcome": bars_to_outcome}
+        outcomes[side] = {
+            "reason": reason,
+            "bars_to_outcome": bars_to_outcome,
+            "realized_r": sign * (exit_price - entry) / stop_distance,
+        }
     return outcomes
 
 
@@ -208,6 +228,7 @@ def iter_labeled_examples(
     opens = df["open"].astype(float)
     highs = df["high"].astype(float)
     lows = df["low"].astype(float)
+    closes = df["close"].astype(float)
     n = len(df)
 
     for i in range(n - horizon):
@@ -221,7 +242,7 @@ def iter_labeled_examples(
             continue
 
         outcomes = _first_barrier(
-            opens, highs, lows, i + 1, horizon,
+            opens, highs, lows, closes, i + 1, horizon,
             atr, stop_atr_multiplier, target_atr_multiplier,
         )
 
@@ -229,6 +250,7 @@ def iter_labeled_examples(
         action = "HOLD"
         outcome: dict[str, Any] = {"reason": "no_qualifying_directional_target", "bars_to_outcome": None}
         candidate = "BUY" if state.signal == 1 else "SELL" if state.signal == -1 else None
+        realized_r: Optional[float] = None
         if not state.session_allowed or not state.volatility_active:
             outcome["reason"] = "regime_filter"
         elif candidate is None:
@@ -243,8 +265,10 @@ def iter_labeled_examples(
             outcome["reason"] = "htf_trend_filter"
         elif outcomes.get(candidate, {}).get("reason") == "target":
             action = candidate
+            realized_r = outcomes[candidate]["realized_r"]
             outcome = {**outcomes[candidate], "reason": f"{candidate.lower()}_target_before_stop"}
         elif candidate in outcomes:
+            realized_r = outcomes[candidate]["realized_r"]
             outcome = {**outcomes[candidate], "reason": f"{candidate.lower()}_{outcomes[candidate]['reason']}"}
         if not state.is_complete():
             continue
@@ -277,6 +301,8 @@ def iter_labeled_examples(
                 "horizon": horizon,
                 "bar_minutes": bar_minutes,
                 "horizon_minutes": horizon * bar_minutes,
+                "candidate": candidate,
+                "realized_r": realized_r,
                 **outcome,
             },
         }
@@ -295,6 +321,33 @@ def generate_jsonl(
     max_directional_fraction: float = DEFAULT_MAX_DIRECTIONAL_FRACTION,
 ) -> dict[str, int]:
     """Read OHLC CSV, label at the selected bar interval, and write JSONL."""
+    records = _records_for_inputs(
+        csv_path,
+        hourly_input,
+        horizon=horizon,
+        atr_multiplier=atr_multiplier,
+        stop_atr_multiplier=stop_atr_multiplier,
+        target_atr_multiplier=target_atr_multiplier,
+        bar_minutes=bar_minutes,
+        max_directional_fraction=max_directional_fraction,
+    )
+    return _write_records(records, output_path)
+
+
+def _records_for_inputs(
+    csv_path: str | Path,
+    hourly_input: str | Path,
+    *,
+    horizon: int,
+    atr_multiplier: Optional[float],
+    stop_atr_multiplier: float,
+    target_atr_multiplier: float,
+    bar_minutes: int,
+    max_directional_fraction: float,
+    apply_cap: bool = True,
+    expected_symbol: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Generate one symbol's records without writing an intermediate file."""
     if bar_minutes < 1:
         raise ValueError("bar_minutes must be >= 1")
     if not 0 < max_directional_fraction < 1:
@@ -321,6 +374,10 @@ def generate_jsonl(
     hourly_symbols = set(hourly["symbol"].dropna().astype(str).str.upper())
     if len(five_symbols) != 1 or len(hourly_symbols) != 1 or five_symbols != hourly_symbols:
         raise ValueError("5-minute and hourly inputs must use the same instrument")
+    if expected_symbol and five_symbols != {expected_symbol.upper()}:
+        raise ValueError(
+            f"CSV symbol {sorted(five_symbols)} does not match filename stem {expected_symbol.upper()}"
+        )
     first_intraday = raw.index.min()
     warmup_bars = int((hourly.index < first_intraday).sum())
     if warmup_bars < 200:
@@ -340,9 +397,6 @@ def generate_jsonl(
         atr_target_multiplier=target_atr_multiplier,
         higher_timeframe_ema=htf_ema,
     ))
-    output = _project_path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-
     records = list(iter_labeled_examples(
         featured,
         horizon=horizon,
@@ -350,7 +404,12 @@ def generate_jsonl(
         target_atr_multiplier=target_atr_multiplier,
         bar_minutes=bar_minutes,
     ))
-    records = _cap_directional_fraction(records, max_directional_fraction)
+    return _cap_directional_fraction(records, max_directional_fraction) if apply_cap else records
+
+
+def _write_records(records: list[dict[str, Any]], output_path: str | Path) -> dict[str, int]:
+    output = _project_path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
     counts: Counter[str] = Counter()
     with output.open("w", encoding="utf-8") as handle:
         for record in records:
@@ -358,6 +417,59 @@ def generate_jsonl(
             counts[record["action"]] += 1
 
     summary = {"total": len(records), **{action: counts[action] for action in ACTIONS}}
+    return summary
+
+
+def generate_universe_jsonl(
+    intraday_dir: str | Path,
+    hourly_dir: str | Path,
+    output_path: str | Path,
+    **options,
+) -> dict[str, int]:
+    """Build one consolidated multi-symbol dataset from paired CSV folders.
+
+    CSVs are paired by filename stem (for example ``AAPL.csv`` in each
+    directory). Every record receives ``meta.symbol`` and the directional
+    prevalence cap is applied once across the combined universe.
+    """
+    intraday_root = _project_path(intraday_dir)
+    hourly_root = _project_path(hourly_dir)
+    if not intraday_root.is_dir() or not hourly_root.is_dir():
+        raise NotADirectoryError("multi-symbol inputs must both be directories")
+    intraday_files = {path.stem.upper(): path for path in intraday_root.glob("*.csv")}
+    hourly_files = {path.stem.upper(): path for path in hourly_root.glob("*.csv")}
+    if not intraday_files:
+        raise ValueError(f"no CSV files found in {intraday_root}")
+    missing_hourly = sorted(set(intraday_files) - set(hourly_files))
+    missing_intraday = sorted(set(hourly_files) - set(intraday_files))
+    if missing_hourly or missing_intraday:
+        raise ValueError(
+            f"input folders must have matching CSV stems; missing hourly={missing_hourly}, "
+            f"missing intraday={missing_intraday}"
+        )
+
+    records: list[dict[str, Any]] = []
+    for symbol in sorted(intraday_files):
+        symbol_records = _records_for_inputs(
+            intraday_files[symbol], hourly_files[symbol],
+            horizon=options.get("horizon", DEFAULT_HORIZON_BARS),
+            atr_multiplier=options.get("atr_multiplier"),
+            stop_atr_multiplier=options.get("stop_atr_multiplier", DEFAULT_ATR_STOP_MULTIPLIER),
+            target_atr_multiplier=options.get("target_atr_multiplier", DEFAULT_ATR_TARGET_MULTIPLIER),
+            bar_minutes=options.get("bar_minutes", DEFAULT_BAR_MINUTES),
+            max_directional_fraction=options.get("max_directional_fraction", DEFAULT_MAX_DIRECTIONAL_FRACTION),
+            apply_cap=False,
+            expected_symbol=symbol,
+        )
+        for record in symbol_records:
+            record["meta"]["symbol"] = symbol
+        records.extend(symbol_records)
+    records = _cap_directional_fraction(
+        records, options.get("max_directional_fraction", DEFAULT_MAX_DIRECTIONAL_FRACTION)
+    )
+    records.sort(key=lambda row: (row["meta"].get("timestamp", ""), row["meta"].get("symbol", "")))
+    summary = _write_records(records, output_path)
+    summary["symbols"] = len(intraday_files)
     return summary
 
 
@@ -409,8 +521,10 @@ def _parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--input", "-i", default="data/5m.csv", help="Path to OHLC CSV (default: data/5m.csv)")
-    parser.add_argument("--hourly-input", required=True,
+    parser.add_argument("--hourly-input",
                         help="Matching timestamped hourly OHLC CSV with at least 200 warmup bars")
+    parser.add_argument("--input-dir", help="Directory of per-symbol intraday CSVs; pair by filename with --hourly-dir")
+    parser.add_argument("--hourly-dir", help="Directory of matching per-symbol hourly CSVs")
     parser.add_argument(
         "--bar-minutes", type=int, default=DEFAULT_BAR_MINUTES,
         help="Expected CSV interval in minutes (default: 5; rejects mismatched timestamped data)",
@@ -445,18 +559,23 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    summary = generate_jsonl(
-        args.input,
-        args.output,
-        hourly_input=args.hourly_input,
+    if bool(args.input_dir) != bool(args.hourly_dir):
+        raise SystemExit("--input-dir and --hourly-dir must be provided together")
+    options = dict(
         horizon=args.horizon,
         stop_atr_multiplier=args.stop_atr_multiplier,
         target_atr_multiplier=args.target_atr_multiplier,
         bar_minutes=args.bar_minutes,
         max_directional_fraction=args.max_directional_fraction,
     )
+    if args.input_dir:
+        summary = generate_universe_jsonl(args.input_dir, args.hourly_dir, args.output, **options)
+    else:
+        if not args.hourly_input:
+            raise SystemExit("--hourly-input is required when --input-dir is not used")
+        summary = generate_jsonl(args.input, args.output, hourly_input=args.hourly_input, **options)
     print(
-        f"Wrote {summary['total']} pairs to {args.output} "
+        f"Wrote {summary['total']} pairs from {summary.get('symbols', 1)} symbol(s) to {args.output} "
         f"(BUY={summary['BUY']}, SELL={summary['SELL']}, HOLD={summary['HOLD']})"
     )
 

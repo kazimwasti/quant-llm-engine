@@ -5,6 +5,12 @@ The JSONL produced by dataset_generator.py is read from
 to ``models/qwen_adapter`` and can be loaded by backtest.py with
 ``--adapter-dir models/qwen_adapter`` (the default).
 
+The per-example loss is R-weighted: directional rows that realized more
+multiples of their stop (``meta.realized_r``) teach proportionally more, and
+background no-setup HOLD rows are down-weighted so the 99% HOLD majority
+cannot swamp the directional signal the classifier exists to learn. Pass
+``--r-weight-scale 0 --hold-weight 1.0`` to recover plain cross-entropy.
+
 Run on a CUDA GPU pod with recent torch, transformers, datasets, peft,
 accelerate, and bitsandbytes installed.
 """
@@ -12,6 +18,7 @@ accelerate, and bitsandbytes installed.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import inspect
 from pathlib import Path
 import sys
@@ -23,6 +30,33 @@ if str(PROJECT_ROOT) not in sys.path:
 LABEL2ID = {"BUY": 0, "SELL": 1, "HOLD": 2}
 ID2LABEL = {value: key for key, value in LABEL2ID.items()}
 DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+DIRECTIONAL = {"BUY", "SELL"}
+
+
+def example_weight(
+    action: str,
+    meta: dict,
+    r_weight_scale: float = 1.0,
+    hold_weight: float = 0.25,
+) -> float:
+    """Per-example loss weight from the label and the barrier outcome.
+
+    - Directional label with a realized outcome: ``1 + r_weight_scale * R``
+      (a +2.2R winner teaches hardest; scales linearly, 0 disables).
+    - HOLD from a gated candidate (stop/timeout): full weight 1.0 -- these
+      are the false positives of the rules and carry the selectivity signal.
+    - HOLD with no candidate (the vast background): ``hold_weight``.
+    - Legacy rows without ``realized_r`` fall back to 1.0 / ``hold_weight``.
+    """
+    action = str(action).upper()
+    realized = meta.get("realized_r") if isinstance(meta, dict) else None
+    if realized is not None:
+        if action in DIRECTIONAL:
+            return 1.0 + r_weight_scale * max(float(realized), 0.0)
+        return 1.0
+    if action in DIRECTIONAL:
+        return 1.0
+    return hold_weight
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-ratio", type=float, default=0.05)
     parser.add_argument("--purge-bars", type=int, default=0,
                         help="Extra chronological gap before validation; actual purge is at least the label horizon")
+    parser.add_argument("--r-weight-scale", type=float, default=1.0,
+                        help="Loss weight slope on realized R for directional rows (0 disables R-weighting)")
+    parser.add_argument("--hold-weight", type=float, default=0.25,
+                        help="Loss weight for background no-setup HOLD rows (1.0 disables rebalancing)")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -70,6 +108,10 @@ def main() -> None:
         raise ValueError("eval_ratio must be > 0 and < 1 to report validation metrics")
     if args.purge_bars < 0:
         raise ValueError("purge_bars cannot be negative")
+    if args.r_weight_scale < 0:
+        raise ValueError("r_weight_scale cannot be negative")
+    if not 0 < args.hold_weight <= 1:
+        raise ValueError("hold_weight must be in (0, 1]")
     data_path = Path(args.data)
     if not data_path.is_absolute():
         data_path = PROJECT_ROOT / data_path
@@ -102,7 +144,11 @@ def main() -> None:
     # Validate every record. Directional labels must attest to a target-first
     # outcome; HOLD remains the label for stops, timeouts, and blocked regimes.
     previous_bar_index = -1
+    previous_timestamp = None
+    timestamp_flags: set[bool] = set()
     maximum_horizon = 0
+    maximum_horizon_minutes = 0
+    maximum_bar_minutes = 0
     for row in dataset:
         if "htf_ema=" not in row["prompt"]:
             raise ValueError("Training prompts lack the htf_ema feature; regenerate with dataset_generator.py")
@@ -118,25 +164,61 @@ def main() -> None:
                 or abs(float(meta.get("target_atr_multiplier", -1)) - 2.2) > 1e-9):
             raise ValueError("Training data must use 1.0x ATR stops and 2.2x ATR targets")
         bar_index = int(meta.get("bar_index", -1))
-        if bar_index <= previous_bar_index:
-            raise ValueError("JSONL rows must be in strictly increasing chronological bar_index order")
-        previous_bar_index = bar_index
+        timestamp = meta.get("timestamp")
+        timestamp_flags.add(bool(timestamp))
+        if timestamp:
+            parsed_timestamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            if parsed_timestamp.tzinfo is None:
+                raise ValueError("Training timestamps must include a timezone")
+            parsed_timestamp = parsed_timestamp.astimezone(timezone.utc)
+            if previous_timestamp is not None and parsed_timestamp < previous_timestamp:
+                raise ValueError("JSONL rows must be sorted chronologically by timestamp")
+            previous_timestamp = parsed_timestamp
+        else:
+            if bar_index <= previous_bar_index:
+                raise ValueError("JSONL rows without timestamps need strictly increasing bar_index values")
+            previous_bar_index = bar_index
         maximum_horizon = max(maximum_horizon, int(meta.get("horizon", 0)))
+        maximum_horizon_minutes = max(
+            maximum_horizon_minutes,
+            int(meta.get("horizon_minutes", int(meta.get("horizon", 0)) * int(meta.get("bar_minutes", 1)))),
+        )
+        maximum_bar_minutes = max(maximum_bar_minutes, int(meta.get("bar_minutes", 1)))
         label = str(row["action"]).upper()
         if label not in LABEL2ID:
             raise ValueError(f"Unknown class label {label!r}; expected BUY, SELL, or HOLD")
         if label in {"BUY", "SELL"} and meta.get("reason") != f"{label.lower()}_target_before_stop":
             raise ValueError(f"{label} row is not marked as a target-before-stop outcome")
 
+    if len(timestamp_flags) > 1:
+        raise ValueError("Training JSONL cannot mix timestamped and untimestamped rows")
+
     eval_start = max(1, int(len(dataset) * (1.0 - args.eval_ratio)))
     if eval_start >= len(dataset):
         eval_start = len(dataset) - 1
     eval_rows = dataset.select(range(eval_start, len(dataset)))
-    eval_first_bar = int(eval_rows[0]["meta"]["bar_index"])
     purge = max(args.purge_bars, maximum_horizon)
     train_end = eval_start
-    while train_end > 0 and int(dataset[train_end - 1]["meta"]["bar_index"]) >= eval_first_bar - purge:
-        train_end -= 1
+    if timestamp_flags == {True}:
+        eval_first_timestamp = datetime.fromisoformat(
+            str(eval_rows[0]["meta"]["timestamp"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        purge_minutes = max(
+            maximum_horizon_minutes,
+            args.purge_bars * max(1, maximum_bar_minutes),
+        )
+        cutoff = eval_first_timestamp - timedelta(minutes=purge_minutes)
+        while train_end > 0:
+            prior_timestamp = datetime.fromisoformat(
+                str(dataset[train_end - 1]["meta"]["timestamp"]).replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+            if prior_timestamp < cutoff:
+                break
+            train_end -= 1
+    else:
+        eval_first_bar = int(eval_rows[0]["meta"]["bar_index"])
+        while train_end > 0 and int(dataset[train_end - 1]["meta"]["bar_index"]) >= eval_first_bar - purge:
+            train_end -= 1
     if train_end < 10 or len(eval_rows) < 2:
         raise ValueError(
             f"Chronological split leaves too little data after a {purge}-bar purge "
@@ -145,9 +227,27 @@ def main() -> None:
     train_dataset = dataset.select(range(train_end))
     eval_dataset = eval_rows
 
+    weight_totals = {"BUY": 0.0, "SELL": 0.0, "HOLD": 0.0}
+    weight_counts = {"BUY": 0, "SELL": 0, "HOLD": 0}
+    for row in dataset:
+        label = str(row["action"]).upper()
+        weight_totals[label] += example_weight(
+            label, row["meta"], args.r_weight_scale, args.hold_weight
+        )
+        weight_counts[label] += 1
+    print("Loss weighting by label (mean weight x rows):")
+    for label in ("BUY", "SELL", "HOLD"):
+        if weight_counts[label]:
+            mean = weight_totals[label] / weight_counts[label]
+            print(f"  {label}: {mean:.3f} x {weight_counts[label]}")
+
     def encode_batch(batch):
         enc = tokenizer(batch["prompt"], truncation=True, max_length=args.max_length)
         enc["labels"] = [LABEL2ID[str(label).upper()] for label in batch["action"]]
+        enc["weight"] = [
+            example_weight(label, meta, args.r_weight_scale, args.hold_weight)
+            for label, meta in zip(batch["action"], batch["meta"])
+        ]
         return enc
 
     source_columns = dataset.column_names
@@ -242,18 +342,56 @@ def main() -> None:
     if unsupported:
         print(f"Dropped TrainingArguments unsupported by this transformers version: {unsupported}")
     training_args = TrainingArguments(**training_kwargs)
-    trainer = Trainer(
+
+    class WeightedCollator:
+        """Pad token fields; carry per-example loss weights alongside."""
+
+        def __init__(self, tokenizer) -> None:
+            self.inner = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+
+        def __call__(self, features):
+            weights = torch.tensor(
+                [float(feature.pop("weight", 1.0)) for feature in features],
+                dtype=torch.float32,
+            )
+            batch = self.inner(features)
+            batch["weight"] = weights
+            return batch
+
+    class RWeightedTrainer(Trainer):
+        """Cross-entropy weighted per example; weights are mean-normalized.
+
+        The normalization keeps the weighted loss on the same scale as plain
+        cross-entropy so the learning rate and cosine schedule stay valid.
+        """
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            weights = inputs.pop("weight", None)
+            labels = inputs["labels"]
+            outputs = model(**inputs)
+            losses = torch.nn.functional.cross_entropy(
+                outputs.logits.view(-1, model.config.num_labels),
+                labels.view(-1),
+                reduction="none",
+            )
+            if weights is None:
+                loss = losses.mean()
+            else:
+                loss = (losses * weights.to(losses.dtype)).sum() / weights.sum().clamp(min=1e-8)
+            return (loss, outputs) if return_outputs else loss
+
+    trainer = RWeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8),
+        data_collator=WeightedCollator(tokenizer),
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
     )
     trainer.train()
     validation_metrics = trainer.evaluate()
-    print("Validation metrics (eval_loss is cross-entropy):")
+    print("Validation metrics (eval_loss is R-weighted cross-entropy):")
     for name, value in sorted(validation_metrics.items()):
         print(f"  {name}: {value}")
     output = Path(args.output_dir)

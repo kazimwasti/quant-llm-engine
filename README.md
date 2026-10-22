@@ -78,16 +78,38 @@ must beat the deterministic baselines on outcomes to keep influence. Wire a
 fine-tuned adapter in by subclassing `LLMPolicySource`.
 
 `ManagedScreen` also attaches one bounded `TradeTopology` to every shortlist.
-It expresses the portfolio-level mandate for the specialist decision agents:
-risk multiplier, maximum holding bars, minimum directional confidence,
-maximum normalized BUY/SELL/HOLD entropy, and an envelope-distance multiplier.
-The latter is a third multiplicative term in the existing predicted-path
-trigger: it narrows the envelope in turbulent/protective conditions and widens
-it slightly in calm conditions to avoid unnecessary inference. The topology is derived from cheap
-market and account-state inputs; it allows at most a modest 1.15x risk budget
-only in calm early conditions with ample loss budget, never as late-session
-target chasing.  `TradingEngine` and `Simulator` enforce those fields, while
-`PropFirmRiskManager` retains final circuit-breaker authority.
+It expresses the portfolio-level mandate for specialist decision agents:
+
+- **Per-trade topology:** risk multiplier, maximum holding bars, minimum
+  directional confidence, maximum normalized BUY/SELL/HOLD entropy, and an
+  envelope-distance multiplier. The latter is a third multiplicative term in
+  the existing predicted-path trigger: it narrows the envelope in
+  turbulent/protective conditions and widens it slightly in calm conditions to
+  avoid unnecessary inference.
+- **Portfolio capacity:** caps on open positions, gross and net directional
+  dollars-at-risk, sector concentration, and correlated positions. The
+  capacity guard only scans the small set of open/pending allocations and uses
+  correlations already computed by the screen; it has no model or extra market
+  data call.
+- **Execution and data quality:** a `TradePreflight` rejects stale or
+  incomplete data, halted/corporate-action symbols, excessive spreads/impact,
+  and oversized estimated participation before an order is authorized.
+- **Turnover restraint:** a stop-out creates a short symbol/cluster cooldown.
+  The backtester skips inference during this window; a strong later setup is
+  delayed rather than permanently blocked.
+- **Conditional model disagreement:** a second scorer is consulted only for a
+  directional decision inside the narrow `confirmation_band` above the
+  confidence threshold. Clear decisions keep the ordinary one-shot Jev path;
+  a marginal disagreement fails closed to HOLD.
+- **Audit record, not generation:** entry basis, stop invalidation, style, and
+  review horizon are assembled deterministically from the existing decision
+  state. The system never calls a model to write a free-form thesis.
+
+The topology is derived from cheap market and account-state inputs; it allows
+at most a modest 1.15x risk budget only in calm early conditions with ample
+loss budget, never as late-session target chasing. `TradingEngine` and
+`Simulator` enforce the per-trade fields, while `PropFirmRiskManager` retains
+final circuit-breaker authority.
 
 ```python
 portfolio = PortfolioContext.from_risk(risk)
@@ -96,6 +118,37 @@ for symbol in screen.shortlist:
     specialist = TradingEngine(risk=risk, topology=screen.topology)
     # Send only universe[symbol] to this specialist.
 ```
+
+For an automatic out-of-sample screen/backtest/feedback cycle, call the managed
+runner with aligned OHLCV frames. It screens only the first `history_bars`,
+keeps those rows solely for indicator warmup, simulates trades on subsequent
+bars for the shortlisted symbols, then credits the combined net return to the
+screen's selected policy. Call it again on the next chronological fold with the
+same `ManagedScreen` to continue the bandit's online learning:
+
+```python
+from backtest.managed_backtest import run_managed_backtest
+
+fold = run_managed_backtest(
+    managed_screen,
+    universe,  # {symbol: aligned OHLCV DataFrame}
+    history_bars=500,
+    initial_balance=risk.equity,
+)
+print(fold["feedback_reward"], fold["bandit_stats"])
+```
+
+`ScreenResult` also carries its `policy_source` and `screen_id` for explicit or
+delayed attribution. The direct `feedback_from_trades(...)` method remains
+available to live orchestrators; folds with no realized trades do not update
+the bandit.
+
+At the broker boundary, build `PaperTradingSafetyController` with matching
+`PortfolioCapacityGuard(screen.topology)` and `ReentryCooldown(screen.topology)`.
+Pass the symbol, sector, precomputed correlations, and bar number to
+`authorize`; release the allocation after a reconciled close or cancellation.
+Supply a current `TradePreflight` to `TradingEngine.step` before live order
+routing. The backtester supplies its deterministic analogue automatically.
 
 Here "entropy" means uncertainty in the closed BUY/SELL/HOLD decision
 distribution. A lower value is more decisive, so the manager uses a maximum
@@ -153,8 +206,17 @@ retaining every HOLD row:
 
 ```powershell
 python scripts/dataset_generator.py --input data/5m_cloud.csv --hourly-input data/hourly_cloud.csv --output data/jev_train_5m.jsonl
+python scripts/dataset_generator.py --input-dir data/universe/5m --hourly-dir data/universe/1h --output data/jev_train_universe.jsonl
 python scripts/train_lora.py --data data/jev_train_5m.jsonl --output-dir models/qwen_adapter
 ```
+
+For the multi-symbol form, put one timestamped OHLC CSV per ticker in each
+folder, with matching filename stems (for example `AAPL.csv` in both). Each
+file must contain a single `symbol`, the intraday bars must match
+`--bar-minutes`, and each hourly file must provide at least 200 completed
+warmup bars. The consolidated records include `meta.symbol`; label balancing
+is applied once across the combined universe. The generator consumes local
+history only—it does not fetch or synthesize market data.
 
 The generator labels BUY/SELL only when a matching strategy signal and regime
 gates are active and the 2.2x ATR target is reached before the 1.0x ATR stop;

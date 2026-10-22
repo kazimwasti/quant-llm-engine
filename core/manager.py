@@ -20,6 +20,7 @@ manager earns trust with outcomes, not rhetoric (Rule 2).
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass, field
 from threading import RLock
@@ -106,6 +107,11 @@ class ScreenResult:
     policy: PolicyWeights
     context: dict[str, float]
     topology: Optional["TradeTopology"] = None
+    # Attribution token for delayed realized-P&L feedback. Keep screen output
+    # self-describing so a later screen cannot steal an earlier reward.
+    policy_source: Optional[str] = None
+    screen_id: Optional[int] = None
+    manager_id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +763,8 @@ class ManagedScreen:
     config: Optional[ScreenerConfig] = None
     forecaster: Optional[Forecaster] = None
     _last_source: Optional[str] = field(default=None, init=False)
+    _screen_sequence: int = field(default=0, init=False)
+    _scored_screen_ids: set[int] = field(default_factory=set, init=False)
 
     def screen(
         self,
@@ -791,15 +799,76 @@ class ManagedScreen:
         names = list(self.sources)
         chosen = self.bandit.select(names)
         self._last_source = chosen
+        self._screen_sequence += 1
         policy = self.sources[chosen].propose(context)
         result = run_screen(
             universe, config=self.config, forecaster=self.forecaster, policy=policy,
             context=raw_context,
         )
         result.topology = derive_trade_topology(context)
+        result.policy_source = chosen
+        result.screen_id = self._screen_sequence
+        result.manager_id = id(self)
         return result, chosen
 
-    def feedback(self, reward: float) -> None:
-        if self._last_source is None:
+    def feedback(self, reward: float, *, screen: Optional[ScreenResult] = None) -> None:
+        """Score realized reward, preferably against the screen that earned it.
+
+        Passing ``screen`` makes asynchronous/multi-symbol feedback safe: the
+        reward is routed to that screen's policy and duplicate settlement is
+        rejected. The no-argument attribution form remains for older callers.
+        """
+        if not isinstance(reward, (int, float)) or not math.isfinite(reward):
+            raise ValueError("reward must be a finite number")
+        if screen is None:
+            source = self._last_source
+            screen_id = None
+        else:
+            source, screen_id = screen.policy_source, screen.screen_id
+            if (
+                source not in self.sources
+                or screen_id is None
+                or screen.manager_id != id(self)
+            ):
+                raise ValueError("screen is missing valid manager attribution")
+            if screen_id in self._scored_screen_ids:
+                raise ValueError(f"screen {screen_id} has already been scored")
+        if source is None:
             raise RuntimeError("no screen has run yet; nothing to score")
-        self.bandit.record(self._last_source, reward)
+        self.bandit.record(source, float(reward))
+        if screen_id is not None:
+            self._scored_screen_ids.add(screen_id)
+
+    def feedback_from_trades(
+        self,
+        screen: ScreenResult,
+        trades,
+        *,
+        starting_equity: float,
+    ) -> float:
+        """Score a screen from its closed trades' net P&L as account return.
+
+        ``trades`` should contain only trades produced by this screen's
+        shortlist and settled before the next feedback batch. No-trade batches
+        are not scored, avoiding a zero-reward bias for policies with slower
+        trade horizons.
+        """
+        if not math.isfinite(starting_equity) or starting_equity <= 0:
+            raise ValueError("starting_equity must be positive")
+        allowed = {symbol.upper() for symbol in screen.shortlist}
+        pnl = 0.0
+        count = 0
+        for trade in trades:
+            symbol = str(trade.get("symbol", "")).upper()
+            if symbol not in allowed:
+                raise ValueError(f"trade symbol {symbol!r} is outside the screen shortlist")
+            value = float(trade["pnl"])
+            if not math.isfinite(value):
+                raise ValueError("trade P&L must be finite")
+            pnl += value
+            count += 1
+        if count == 0:
+            raise ValueError("cannot score a screen without realized trades")
+        reward = pnl / float(starting_equity)
+        self.feedback(reward, screen=screen)
+        return reward

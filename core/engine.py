@@ -709,6 +709,7 @@ def build_execution_payload(
         point_value=point_value,
         cost_per_contract=cost_per_contract,
         manager_risk_multiplier=manager_risk_multiplier,
+        confidence=decision.confidence,
     )
     if size.blocked or size.quantity <= 0:
         return ExecutionPayload(

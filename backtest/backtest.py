@@ -118,6 +118,7 @@ class Simulator:
         *,
         higher_timeframe: pd.DataFrame | None = None,
         output_prefix: str = "backtest",
+        trade_start_index: int = 0,
     ) -> dict:
         required = {"open", "high", "low", "close"}
         missing = required.difference(source.columns)
@@ -125,6 +126,8 @@ class Simulator:
             raise ValueError(f"CSV is missing OHLC columns: {sorted(missing)}")
         if source.empty:
             raise ValueError("OHLC input has no rows")
+        if not 0 <= trade_start_index < len(source):
+            raise ValueError("trade_start_index must identify a bar in the input")
 
         intraday = source.reset_index(drop=True)
         higher_timeframe_ema = None
@@ -164,6 +167,10 @@ class Simulator:
             local_minute = local_ts.hour * 60 + local_ts.minute if pd.notna(local_ts) and hasattr(local_ts, "hour") else 0
             session_elapsed = min(1.0, ((local_minute - 18 * 60) % (24 * 60)) / (23 * 60))
             self.risk_manager.session_progress = session_elapsed
+            # Keep pre-test bars for indicator warmup, but do not simulate
+            # orders or ask the decision model to evaluate them.
+            if i < trade_start_index:
+                continue
             self._activate_pending_order(row, ts)
 
             if pd.isna(row.ema_200) or pd.isna(row.atr_14) or row.atr_14 <= 0:
